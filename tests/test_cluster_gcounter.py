@@ -1,10 +1,12 @@
 """The G-Counter running on three real replica processes.
 
-These tests check that every increment arrives everywhere, not just that the
-replicas agree: three replicas that all lost the same increment would agree
-too. Each test works out the exact slots it expects and checks every replica
-has exactly those.
+The counting tests check that every increment arrives everywhere, not just
+that the replicas agree: three replicas that all lost the same increment
+would agree too. They work out the exact slots they expect and check every
+replica has exactly those.
 """
+
+import json
 
 from websockets.sync.client import connect
 
@@ -43,11 +45,13 @@ def test_restarted_replica_catches_up_and_keeps_counting(cluster):
     a = cluster.increment("A", 1)["incarnation"]
     expected[f"A#{a}"] = 1
 
-    # B comes back empty, with a new incarnation, and counts again right away,
-    # before it has caught up.
+    # B comes back empty, with a new incarnation, and counts again as soon as
+    # it's reachable (it may or may not have caught up by then). We wait with
+    # get_state and increment exactly once: retrying the increment itself
+    # could count twice.
     cluster.start("B")
-    reply = wait_until(lambda: cluster.increment("B", 1))
-    new_b = reply["incarnation"]
+    wait_until(lambda: cluster.state("B"))
+    new_b = cluster.increment("B", 1)["incarnation"]
     assert new_b != old_b
     expected[f"B#{new_b}"] = 1
 
@@ -57,9 +61,23 @@ def test_restarted_replica_catches_up_and_keeps_counting(cluster):
     assert all(cluster.state(rid)["counter"] == 7 for rid in REPLICA_IDS)
 
 
-def test_bad_message_does_not_crash_a_replica(cluster):
+def test_bad_messages_are_ignored_and_the_connection_keeps_working(cluster):
+    bad_messages = [
+        "this is not json",
+        '{"v": 1, "type": ["sync"]}',  # type isn't a string
+        '{"v": true, "type": "get_state"}',  # version isn't a number
+        '{"v": 1, "type": "sync", "from": "Z", "inc": 1, "counter": {}}',  # unknown replica
+        '{"v": 1, "type": "sync", "from": "B", "inc": 1, "counter": {"B#1": -5}}',
+        '{"v": 1, "type": "increment", "amount": 2.5}',
+    ]
     with connect(f"ws://{HOST}:{cluster.port('A')}") as ws:
-        ws.send("this is not json")
-        ws.send('{"v": 1, "type": "sync", "from": "Z", "inc": 1, "counter": {}}')
-        ws.send('{"v": 1, "type": "sync", "from": "B", "inc": 1, "counter": {"B#1": -5}}')
-    assert cluster.state("A")["counter"] == 0
+        for bad in bad_messages:
+            ws.send(bad)
+            # The same connection must still answer a valid command, which
+            # proves the bad message didn't kill the handler.
+            ws.send(json.dumps({"v": 1, "type": "get_state"}))
+            reply = json.loads(ws.recv(timeout=2))
+            if reply["type"] == "error":  # the bad increment gets an error reply first
+                reply = json.loads(ws.recv(timeout=2))
+            assert reply["type"] == "state", bad
+            assert reply["counter"] == 0, bad

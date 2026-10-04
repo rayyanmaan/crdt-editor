@@ -45,8 +45,10 @@ class Replica:
 
         # Which run of this replica this is. A restarted replica gets a new
         # incarnation, so nothing it creates can clash with what its previous
-        # run created. Milliseconds since 1970 is unique enough on one laptop.
-        # (Once state is saved to disk, this becomes a saved counter.)
+        # run created. It only has to be unique per replica: slots are named
+        # "A#...", "B#...", so A and B may share a number. Milliseconds since
+        # 1970 is unique enough here, but it relies on the clock never going
+        # backwards. (Once state is saved to disk, this becomes a saved counter.)
         self.incarnation = time.time_ns() // 1_000_000
         self.slot = f"{self.id}#{self.incarnation}"
 
@@ -123,10 +125,10 @@ class Replica:
 
     def on_command(self, msg):
         if msg["type"] == "increment":
-            amount = msg.get("amount", 1)
-            if not isinstance(amount, int) or isinstance(amount, bool) or amount < 1:
-                return {"type": "error", "error": "amount must be a positive integer"}
-            self.counter.increment(self.slot, amount)
+            try:
+                self.counter.increment(self.slot, msg.get("amount", 1))
+            except ValueError as e:
+                return {"type": "error", "error": str(e)}
         return self.state()
 
     def state(self):
@@ -156,7 +158,9 @@ class Replica:
         try:
             self.outbox[peer].put_nowait({**msg, "from": self.id, "inc": self.incarnation})
         except asyncio.QueueFull:
-            pass  # the link is backed up; a later sync will carry the same state
+            # The link is backed up, so this message is dropped. That's safe
+            # only because every sync carries the full state.
+            pass
 
     async def keep_link_open(self, peer):
         """Keep an outgoing link to one peer alive, reconnecting forever.
@@ -174,7 +178,10 @@ class Replica:
                     while True:
                         msg = await self.outbox[peer].get()
                         await ws.send(encode(msg))
-            except (OSError, websockets.ConnectionClosed):
+            # OSError: peer not listening. TimeoutError: the connection attempt
+            # stalled (on Python 3.9 asyncio's TimeoutError is not an OSError).
+            # WebSocketException: the link closed, or the handshake failed.
+            except (OSError, asyncio.TimeoutError, websockets.WebSocketException):
                 if peer in self.connected:
                     self.log.warning("link to %s is down, retrying", peer)
                 self.connected.discard(peer)
@@ -185,8 +192,9 @@ class Replica:
     async def sync_loop(self):
         """Send our full state to every peer, forever.
 
-        This is also what makes a dead link visible: a link only reports that
-        it's broken when we try to send on it.
+        Regular sends are also how we notice a dead link quickly: a send on a
+        closed connection fails at once. (The websockets library also pings in
+        the background, but only every 20 seconds.)
         """
         while True:
             for peer in self.peers:

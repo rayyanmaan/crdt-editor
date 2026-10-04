@@ -23,9 +23,10 @@ def test_value_is_sum_of_slots():
     assert c.value() == 4
 
 
-def test_cannot_decrement():
+@pytest.mark.parametrize("amount", [-1, 0, 2.5, True, "3"])
+def test_increment_rejects_anything_but_a_positive_whole_number(amount):
     with pytest.raises(ValueError):
-        GCounter().increment("A#1", -1)
+        GCounter().increment("A#1", amount)
 
 
 @pytest.mark.parametrize("a,b", itertools.product(EXAMPLES, repeat=2))

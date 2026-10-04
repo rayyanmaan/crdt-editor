@@ -34,24 +34,30 @@ def encode(msg):
     return json.dumps({"v": VERSION, **msg})
 
 
+def is_int(value):
+    """True for real integers. bool is a subclass of int in Python, so rule it out."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
 def decode(raw):
     try:
         msg = json.loads(raw)
-    except ValueError:
+    except (ValueError, RecursionError):  # RecursionError: absurdly deep nesting
         raise BadMessage("not valid JSON")
     if not isinstance(msg, dict):
         raise BadMessage("not a JSON object")
-    if msg.get("v") != VERSION:
+    if not is_int(msg.get("v")) or msg["v"] != VERSION:
         raise BadMessage(f"unsupported version {msg.get('v')!r}")
 
     kind = msg.get("type")
+    if not isinstance(kind, str):
+        raise BadMessage("missing message type")
     if kind in COMMAND_TYPES:
         return msg
     if kind in PEER_TYPES:
         if not isinstance(msg.get("from"), str):
             raise BadMessage("missing sender")
-        # bool is a subclass of int in Python, so rule it out explicitly
-        if not isinstance(msg.get("inc"), int) or isinstance(msg.get("inc"), bool):
+        if not is_int(msg.get("inc")):
             raise BadMessage("missing incarnation")
         return msg
     raise BadMessage(f"unknown message type {kind!r}")

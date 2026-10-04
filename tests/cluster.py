@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 
+from websockets.exceptions import WebSocketException
 from websockets.sync.client import connect
 
 from config import HOST, REPLICA_IDS
@@ -29,12 +30,22 @@ class Cluster:
         return TEST_BASE_PORT + REPLICA_IDS.index(rid)
 
     def start(self, rid):
+        if rid in self.procs and self.procs[rid].poll() is None:
+            raise RuntimeError(f"replica {rid} is already running")
         # Each run of a replica gets its own log file, kept for debugging.
-        log = open(os.path.join(self.log_dir, f"{rid}-{time.time_ns()}.log"), "w")
-        self.procs[rid] = subprocess.Popen(
-            [sys.executable, "replica.py", rid],
-            cwd=ROOT, env=self.env, stdout=log, stderr=subprocess.STDOUT,
-        )
+        # The child process keeps its own handle, so ours can be closed.
+        with open(os.path.join(self.log_dir, f"{rid}-{time.time_ns()}.log"), "w") as log:
+            self.procs[rid] = subprocess.Popen(
+                [sys.executable, "replica.py", rid],
+                cwd=ROOT, env=self.env, stdout=log, stderr=subprocess.STDOUT,
+            )
+
+    def all_alive(self):
+        """Fails loudly if a replica exited, e.g. because its port was taken."""
+        for rid, proc in self.procs.items():
+            if proc.poll() is not None:
+                raise AssertionError(f"replica {rid} exited with code {proc.returncode}")
+        return True
 
     def start_all(self):
         for rid in REPLICA_IDS:
@@ -47,7 +58,8 @@ class Cluster:
 
     def stop_all(self):
         for proc in self.procs.values():
-            proc.kill()
+            if proc.poll() is None:
+                proc.kill()
         for proc in self.procs.values():
             proc.wait()
 
@@ -78,7 +90,7 @@ def wait_until(check, timeout=10.0, interval=0.1):
             last = check()
             if last:
                 return last
-        except (OSError, TimeoutError):
+        except (OSError, TimeoutError, WebSocketException):
             last = "replica not reachable"
         time.sleep(interval)
     raise AssertionError(f"condition not met within {timeout}s (last result: {last!r})")

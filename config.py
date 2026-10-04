@@ -27,6 +27,7 @@ SUSPECT_AFTER = 3.0
 # How long to wait before retrying a peer we can't reach, in seconds.
 RECONNECT_DELAY = 1.0
 
-# Most messages that can wait on one outgoing link. Every sync carries the full
-# state, so if a link backs up, dropping old syncs loses nothing.
+# Most messages that can wait on one outgoing link. When it's full, new
+# messages are dropped. Every sync carries the full state, so that loses
+# nothing that a later sync won't bring.
 OUTBOX_LIMIT = 100

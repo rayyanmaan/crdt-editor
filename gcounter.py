@@ -27,8 +27,8 @@ class GCounter:
         self.slots = dict(slots or {})
 
     def increment(self, slot, amount=1):
-        if amount < 1:
-            raise ValueError("a G-Counter can only go up")
+        if not isinstance(amount, int) or isinstance(amount, bool) or amount < 1:
+            raise ValueError("a G-Counter can only go up, by a whole number")
         self.slots[slot] = self.slots.get(slot, 0) + amount
 
     def value(self):
