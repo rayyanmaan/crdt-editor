@@ -65,15 +65,26 @@ class Cluster:
 
     def command(self, rid, msg):
         """Send one command to a replica and return its reply."""
-        with connect(f"ws://{HOST}:{self.port(rid)}", open_timeout=1) as ws:
-            ws.send(json.dumps({"v": 1, **msg}))
-            return json.loads(ws.recv(timeout=2))
+        return send_command(self.port(rid), msg)
 
     def state(self, rid):
         return self.command(rid, {"type": "get_state"})
 
     def increment(self, rid, amount=1):
         return self.command(rid, {"type": "increment", "amount": amount})
+
+    def add(self, rid, element):
+        return self.command(rid, {"type": "add", "element": element})
+
+    def remove(self, rid, element):
+        return self.command(rid, {"type": "remove", "element": element})
+
+
+def send_command(port, msg):
+    """Open a connection, send one command, return the reply."""
+    with connect(f"ws://{HOST}:{port}", open_timeout=1) as ws:
+        ws.send(json.dumps({"v": 1, **msg}))
+        return json.loads(ws.recv(timeout=2))
 
 
 def wait_until(check, timeout=10.0, interval=0.1):

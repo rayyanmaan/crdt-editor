@@ -14,13 +14,14 @@ which is a realistic kind of network failure.
 
 What they say
 -------------
-Every SYNC_INTERVAL, each replica sends its whole counter to every peer, and
-a peer that receives it merges it into its own. This is anti-entropy: no
-message has to arrive, because a later sync carries everything an earlier one
-did. The same message works as a heartbeat for the failure detector.
+Every SYNC_INTERVAL, each replica sends its whole state (counter and set) to
+every peer, and a peer that receives it merges it into its own. This is
+anti-entropy: no message has to arrive, because a later sync carries
+everything an earlier one did. The same message works as a heartbeat for the
+failure detector.
 
 The dashboard and the tests also connect to the server, to send commands
-("increment", "get_state") and read the replies.
+("increment", "add", "remove", "get_state") and read the replies.
 """
 
 import asyncio
@@ -32,8 +33,11 @@ import websockets
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
 
-from config import HOST, OUTBOX_LIMIT, RECONNECT_DELAY, REPLICAS, SUSPECT_AFTER, SYNC_INTERVAL
+from config import (
+    HOST, MAX_MESSAGE_BYTES, OUTBOX_LIMIT, RECONNECT_DELAY, REPLICAS, SUSPECT_AFTER, SYNC_INTERVAL,
+)
 from gcounter import GCounter
+from orset import ORSet
 from protocol import COMMAND_TYPES, BadMessage, decode, encode
 
 
@@ -53,6 +57,11 @@ class Replica:
         self.slot = f"{self.id}#{self.incarnation}"
 
         self.counter = GCounter()
+        self.set = ORSet()
+        # Tags for set adds are "<slot>:<n>". The slot includes the
+        # incarnation, so a restarted replica counting n from 1 again still
+        # makes tags nobody has used.
+        self.tags_made = 0
 
         # Messages waiting to go out on each outgoing link. Filled in by run():
         # on Python 3.9 a Queue must be created inside the running event loop.
@@ -116,19 +125,38 @@ class Replica:
         if msg["type"] == "hello":
             self.log.info("%s says hello", sender)
         elif msg["type"] == "sync":
+            # Check both parts before merging either, so a half-bad message
+            # changes nothing.
             try:
-                theirs = GCounter.from_dict(msg.get("counter"))
+                their_counter = GCounter.from_dict(msg.get("counter"))
+                their_set = ORSet.from_dict(msg.get("set"))
             except ValueError as e:
-                self.log.warning("bad counter from %s: %s", sender, e)
+                self.log.warning("bad sync from %s: %s", sender, e)
                 return
-            self.counter = self.counter.merge(theirs)
+            self.counter = self.counter.merge(their_counter)
+            self.set = self.set.merge(their_set)
 
     def on_command(self, msg):
-        if msg["type"] == "increment":
+        kind = msg["type"]
+        if kind == "increment":
             try:
                 self.counter.increment(self.slot, msg.get("amount", 1))
             except ValueError as e:
                 return {"type": "error", "error": str(e)}
+            return self.state()
+
+        if kind in ("add", "remove"):
+            element = msg.get("element")
+            if not isinstance(element, str) or not element:
+                return {"type": "error", "error": "element must be a non-empty string"}
+            if kind == "add":
+                self.tags_made += 1
+                tag = f"{self.slot}:{self.tags_made}"
+                self.set.add(element, tag)
+                return {**self.state(), "tag": tag}
+            tombstoned = self.set.remove(element)
+            return {**self.state(), "tombstoned": sorted(tombstoned)}
+
         return self.state()
 
     def state(self):
@@ -139,6 +167,8 @@ class Replica:
             "incarnation": self.incarnation,
             "counter": self.counter.value(),
             "slots": self.counter.to_dict(),
+            "set": self.set.elements(),
+            "set_state": self.set.to_dict(),
             "peers": {
                 p: {
                     "status": self.peer_status(p),
@@ -197,15 +227,21 @@ class Replica:
         the background, but only every 20 seconds.)
         """
         while True:
+            sync = {"type": "sync", "counter": self.counter.to_dict(), "set": self.set.to_dict()}
+            # Full state only grows (tombstones are never deleted). A peer
+            # rejects messages over MAX_MESSAGE_BYTES, so say so loudly rather
+            # than failing quietly on every sync.
+            if len(encode(sync)) > MAX_MESSAGE_BYTES:
+                self.log.error("state is too big to sync (over %d bytes)", MAX_MESSAGE_BYTES)
             for peer in self.peers:
-                self.send(peer, {"type": "sync", "counter": self.counter.to_dict()})
+                self.send(peer, sync)
             await asyncio.sleep(SYNC_INTERVAL)
 
     # ---- main ------------------------------------------------------------
 
     async def run(self):
         self.outbox = {peer: asyncio.Queue(OUTBOX_LIMIT) for peer in self.peers}
-        async with serve(self.handle_incoming, HOST, self.port):
+        async with serve(self.handle_incoming, HOST, self.port, max_size=MAX_MESSAGE_BYTES):
             self.log.info("listening on port %d (incarnation %d)", self.port, self.incarnation)
             await asyncio.gather(
                 self.sync_loop(),

@@ -27,6 +27,14 @@ SUSPECT_AFTER = 3.0
 # How long to wait before retrying a peer we can't reach, in seconds.
 RECONNECT_DELAY = 1.0
 
+# Largest message a replica accepts. This is the websockets library's default
+# (1 MiB), written out so the limit is a deliberate choice. Full-state syncs
+# grow with every set tombstone, so a very long-running demo could reach it.
+MAX_MESSAGE_BYTES = 2**20
+
+# Port of the supervisor (run.py), which starts and kills replicas on request.
+SUPERVISOR_PORT = BASE_PORT - 1
+
 # Most messages that can wait on one outgoing link. When it's full, new
 # messages are dropped. Every sync carries the full state, so that loses
 # nothing that a later sync won't bring.

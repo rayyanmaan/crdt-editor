@@ -8,8 +8,11 @@ number and a type:
 Two kinds of message arrive at a replica:
 - From other replicas ("hello", "sync"). These also say which replica sent
   them ("from") and which run of that replica ("inc", the incarnation).
-- From the dashboard or the tests ("increment", "get_state"). These get a
-  reply on the same connection.
+- From the dashboard or the tests ("increment", "add", "remove",
+  "get_state"). These get a reply on the same connection.
+
+The supervisor (run.py) uses the same format for its own commands ("start",
+"kill", "status").
 
 Anything that doesn't fit is rejected with BadMessage, so a malformed message
 gets logged and ignored and can't crash a replica.
@@ -23,7 +26,8 @@ import json
 VERSION = 1
 
 PEER_TYPES = {"hello", "sync"}
-COMMAND_TYPES = {"increment", "get_state"}
+COMMAND_TYPES = {"increment", "add", "remove", "get_state"}
+SUPERVISOR_TYPES = {"start", "kill", "status"}
 
 
 class BadMessage(Exception):
@@ -39,7 +43,9 @@ def is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 
 
-def decode(raw):
+def decode(raw, commands=COMMAND_TYPES):
+    """Parse and check one message. `commands` is which commands the receiver
+    accepts: replicas take COMMAND_TYPES, the supervisor SUPERVISOR_TYPES."""
     try:
         msg = json.loads(raw)
     except (ValueError, RecursionError):  # RecursionError: absurdly deep nesting
@@ -52,7 +58,7 @@ def decode(raw):
     kind = msg.get("type")
     if not isinstance(kind, str):
         raise BadMessage("missing message type")
-    if kind in COMMAND_TYPES:
+    if kind in commands:
         return msg
     if kind in PEER_TYPES:
         if not isinstance(msg.get("from"), str):
