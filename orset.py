@@ -68,17 +68,31 @@ class ORSet:
 
     @classmethod
     def from_dict(cls, data):
-        """Build a set from a peer's message, rejecting anything malformed."""
+        """Build a set from a peer's message.
+
+        Rejects anything a replica could never have produced: wrong types,
+        empty names or tags, an element with no tags, or one tag under two
+        elements (removing one element would then remove the other).
+        """
         if not isinstance(data, dict):
             raise ValueError("set state must be an object")
         adds, removed = data.get("adds"), data.get("removed")
         if not isinstance(adds, dict) or not isinstance(removed, list):
             raise ValueError("set state needs 'adds' and 'removed'")
-        for tags in adds.values():
-            if not isinstance(tags, list) or not all(isinstance(t, str) for t in tags):
-                raise ValueError("tags must be a list of strings")
-        if not all(isinstance(t, str) for t in removed):
-            raise ValueError("tombstones must be strings")
+        seen = set()
+        for element, tags in adds.items():
+            if not isinstance(element, str) or not element:
+                raise ValueError("elements must be non-empty strings")
+            if not isinstance(tags, list) or not tags:
+                raise ValueError(f"tags of {element!r} must be a non-empty list")
+            for tag in tags:
+                if not isinstance(tag, str) or not tag:
+                    raise ValueError("tags must be non-empty strings")
+                if tag in seen:
+                    raise ValueError(f"tag {tag!r} appears twice")
+                seen.add(tag)
+        if not all(isinstance(t, str) and t for t in removed):
+            raise ValueError("tombstones must be non-empty strings")
         return cls(adds, removed)
 
     def __eq__(self, other):

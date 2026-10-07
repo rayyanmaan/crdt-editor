@@ -64,7 +64,22 @@ def test_restart_with_new_incarnation_does_not_hide_increments():
     assert a.merge(reused).value() == 5
 
 
-@pytest.mark.parametrize("bad", ["nope", {"A#1": -1}, {"A#1": "3"}, {"A#1": True}])
+@pytest.mark.parametrize(
+    "bad", ["nope", {"A#1": -1}, {"A#1": 0}, {"A#1": "3"}, {"A#1": True}, {"": 1}, {1: 1}]
+)
 def test_from_dict_rejects_malformed_state(bad):
     with pytest.raises(ValueError):
         GCounter.from_dict(bad)
+
+
+@pytest.mark.parametrize("a,b", itertools.product(EXAMPLES, repeat=2))
+def test_merge_does_not_change_its_inputs(a, b):
+    before_a, before_b = a.to_dict(), b.to_dict()
+    a.merge(b)
+    assert a.to_dict() == before_a and b.to_dict() == before_b
+
+
+def test_same_state_encodes_the_same_way():
+    one = GCounter({"B#1": 2, "A#1": 1})
+    two = GCounter({"A#1": 1, "B#1": 2})
+    assert list(one.to_dict()) == list(two.to_dict()) == ["A#1", "B#1"]

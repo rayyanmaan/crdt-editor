@@ -42,15 +42,23 @@ class GCounter:
         return GCounter(merged)
 
     def to_dict(self):
-        return dict(self.slots)
+        # Sorted, so the same state always encodes the same way.
+        return dict(sorted(self.slots.items()))
 
     @classmethod
     def from_dict(cls, data):
-        """Build a counter from a peer's message, rejecting anything malformed."""
+        """Build a counter from a peer's message.
+
+        Rejects anything a replica could never have produced: wrong types,
+        empty slot names, or counts below 1 (a slot only exists once its
+        owner has counted).
+        """
         if not isinstance(data, dict):
             raise ValueError("counter state must be an object")
         for slot, count in data.items():
-            if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            if not isinstance(slot, str) or not slot:
+                raise ValueError("slot names must be non-empty strings")
+            if not isinstance(count, int) or isinstance(count, bool) or count < 1:
                 raise ValueError(f"bad count for slot {slot!r}")
         return cls(data)
 

@@ -38,19 +38,25 @@ log = logging.getLogger("supervisor")
 class Supervisor:
     def __init__(self):
         self.procs = {}
+        # One lock per replica, so start and kill for the same replica happen
+        # one at a time. Without it, two "start" commands arriving together
+        # could both see "not running" while the first process was still
+        # launching, and start two copies.
+        self.locks = {rid: asyncio.Lock() for rid in REPLICAS}
 
     def running(self, rid):
         proc = self.procs.get(rid)
         return proc is not None and proc.returncode is None
 
     async def start(self, rid):
-        if self.running(rid):
-            return
-        # cwd=ROOT so this works no matter which folder run.py is started from.
-        proc = await asyncio.create_subprocess_exec(sys.executable, "replica.py", rid, cwd=ROOT)
-        self.procs[rid] = proc
-        log.info("started replica %s (pid %d)", rid, proc.pid)
-        asyncio.ensure_future(self.report_exit(rid, proc))
+        async with self.locks[rid]:
+            if self.running(rid):
+                return
+            # cwd=ROOT so this works no matter which folder run.py is started from.
+            proc = await asyncio.create_subprocess_exec(sys.executable, "replica.py", rid, cwd=ROOT)
+            self.procs[rid] = proc
+            log.info("started replica %s (pid %d)", rid, proc.pid)
+            asyncio.ensure_future(self.report_exit(rid, proc))
 
     async def report_exit(self, rid, proc):
         code = await proc.wait()
@@ -58,12 +64,19 @@ class Supervisor:
 
     async def kill(self, rid):
         """SIGKILL: the replica gets no chance to clean up, like a real crash."""
-        if not self.running(rid):
-            return
-        self.procs[rid].kill()
-        await self.procs[rid].wait()
+        async with self.locks[rid]:
+            if not self.running(rid):
+                return
+            self.procs[rid].kill()
+            await self.procs[rid].wait()
 
     def status(self):
+        """Which replicas have a live process.
+
+        "running" means the process exists, not that it's ready: a replica
+        that can't get its port exits a moment later. Ask the replica itself
+        (get_state) to know it's answering.
+        """
         return {
             "type": "status",
             "replicas": {
@@ -84,9 +97,12 @@ class Supervisor:
                 except BadMessage as e:
                     await ws.send(encode({"type": "error", "error": str(e)}))
                     continue
+                if msg["type"] not in SUPERVISOR_TYPES:  # e.g. a replica's sync
+                    await ws.send(encode({"type": "error", "error": "not a supervisor command"}))
+                    continue
                 if msg["type"] in ("start", "kill"):
                     rid = msg.get("replica")
-                    if rid not in REPLICAS:
+                    if not isinstance(rid, str) or rid not in REPLICAS:
                         await ws.send(encode({"type": "error", "error": f"no replica {rid!r}"}))
                         continue
                     await (self.start(rid) if msg["type"] == "start" else self.kill(rid))
@@ -121,7 +137,14 @@ def main():
         level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S"
     )
     logging.getLogger("websockets").setLevel(logging.WARNING)
-    asyncio.run(Supervisor().run())
+    asyncio.run(supervise())
+
+
+async def supervise():
+    # Created here, inside the running event loop: on Python 3.9 an
+    # asyncio.Lock made outside it belongs to the wrong loop and fails the
+    # first time two commands actually wait on it.
+    await Supervisor().run()
 
 
 if __name__ == "__main__":

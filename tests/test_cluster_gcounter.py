@@ -67,7 +67,12 @@ def test_bad_messages_are_ignored_and_the_connection_keeps_working(cluster):
         '{"v": 1, "type": ["sync"]}',  # type isn't a string
         '{"v": true, "type": "get_state"}',  # version isn't a number
         '{"v": 1, "type": "sync", "from": "Z", "inc": 1, "counter": {}}',  # unknown replica
-        '{"v": 1, "type": "sync", "from": "B", "inc": 1, "counter": {"B#1": -5}}',
+        # Each sync below is bad in exactly one way, so each tests one check.
+        '{"v": 1, "type": "sync", "from": "B", "inc": 1, "counter": {"B#1": -5}, '
+        '"set": {"adds": {}, "removed": []}}',
+        # A valid counter change with a broken set: neither may be merged.
+        '{"v": 1, "type": "sync", "from": "B", "inc": 1, "counter": {"B#1": 5}, '
+        '"set": {"adds": {"x": []}, "removed": []}}',
         '{"v": 1, "type": "increment", "amount": 2.5}',
     ]
     with connect(f"ws://{HOST}:{cluster.port('A')}") as ws:
@@ -81,3 +86,4 @@ def test_bad_messages_are_ignored_and_the_connection_keeps_working(cluster):
                 reply = json.loads(ws.recv(timeout=2))
             assert reply["type"] == "state", bad
             assert reply["counter"] == 0, bad
+            assert reply["set_state"] == {"adds": {}, "removed": []}, bad

@@ -112,8 +112,20 @@ def test_round_trip_through_dict():
         {"adds": {"x": "A:1"}, "removed": []},  # tags not a list
         {"adds": {"x": [1]}, "removed": []},
         {"adds": {}, "removed": [1]},
+        {"adds": {"": ["A:1"]}, "removed": []},  # empty element name
+        {"adds": {"x": []}, "removed": []},  # element with no tags
+        {"adds": {"x": [""]}, "removed": []},  # empty tag
+        {"adds": {"x": ["A:1"], "y": ["A:1"]}, "removed": []},  # one tag, two elements
+        {"adds": {}, "removed": [""]},
     ],
 )
 def test_from_dict_rejects_malformed_state(bad):
     with pytest.raises(ValueError):
         ORSet.from_dict(bad)
+
+
+@pytest.mark.parametrize("a,b", itertools.product(EXAMPLES, repeat=2))
+def test_merge_does_not_change_its_inputs(a, b):
+    before_a, before_b = a.to_dict(), b.to_dict()
+    a.merge(b)
+    assert a.to_dict() == before_a and b.to_dict() == before_b

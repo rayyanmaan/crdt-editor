@@ -126,7 +126,8 @@ class Replica:
             self.log.info("%s says hello", sender)
         elif msg["type"] == "sync":
             # Check both parts before merging either, so a half-bad message
-            # changes nothing.
+            # changes neither the counter nor the set. (It still counts as
+            # hearing from the peer.)
             try:
                 their_counter = GCounter.from_dict(msg.get("counter"))
                 their_set = ORSet.from_dict(msg.get("set"))
@@ -139,10 +140,14 @@ class Replica:
     def on_command(self, msg):
         kind = msg["type"]
         if kind == "increment":
+            counter = self.counter.merge(GCounter())  # a copy to try it on
             try:
-                self.counter.increment(self.slot, msg.get("amount", 1))
+                counter.increment(self.slot, msg.get("amount", 1))
             except ValueError as e:
                 return {"type": "error", "error": str(e)}
+            if self.too_big_to_sync(counter, self.set):
+                return {"type": "error", "error": "state is too big to sync"}
+            self.counter = counter
             return self.state()
 
         if kind in ("add", "remove"):
@@ -150,14 +155,30 @@ class Replica:
             if not isinstance(element, str) or not element:
                 return {"type": "error", "error": "element must be a non-empty string"}
             if kind == "add":
+                tag = f"{self.slot}:{self.tags_made + 1}"
+                new_set = self.set.merge(ORSet())  # a copy to try it on
+                new_set.add(element, tag)
+                # Refuse an edit we couldn't replicate, rather than accept it
+                # and have every peer reject our syncs from then on.
+                if self.too_big_to_sync(self.counter, new_set):
+                    return {"type": "error", "error": "state is too big to sync"}
                 self.tags_made += 1
-                tag = f"{self.slot}:{self.tags_made}"
-                self.set.add(element, tag)
+                self.set = new_set
                 return {**self.state(), "tag": tag}
             tombstoned = self.set.remove(element)
             return {**self.state(), "tombstoned": sorted(tombstoned)}
 
         return self.state()
+
+    def sync_message(self, counter, set_):
+        """The exact message a sync sends, including the envelope fields."""
+        return {
+            "type": "sync", "from": self.id, "inc": self.incarnation,
+            "counter": counter.to_dict(), "set": set_.to_dict(),
+        }
+
+    def too_big_to_sync(self, counter, set_):
+        return len(encode(self.sync_message(counter, set_))) > MAX_MESSAGE_BYTES
 
     def state(self):
         """Everything the dashboard and tests need to see about this replica."""
@@ -174,6 +195,11 @@ class Replica:
                     "status": self.peer_status(p),
                     "link_up": p in self.connected,
                     "incarnation": self.peer_incarnation.get(p),
+                    # Seconds since we last heard from them, for the dashboard.
+                    "last_heard_ago": (
+                        round(time.monotonic() - self.last_heard[p], 1)
+                        if p in self.last_heard else None
+                    ),
                 }
                 for p in self.peers
             },
@@ -227,11 +253,12 @@ class Replica:
         the background, but only every 20 seconds.)
         """
         while True:
-            sync = {"type": "sync", "counter": self.counter.to_dict(), "set": self.set.to_dict()}
-            # Full state only grows (tombstones are never deleted). A peer
-            # rejects messages over MAX_MESSAGE_BYTES, so say so loudly rather
-            # than failing quietly on every sync.
-            if len(encode(sync)) > MAX_MESSAGE_BYTES:
+            sync = self.sync_message(self.counter, self.set)
+            # Full state only grows (tombstones are never deleted). Edits that
+            # would make it too big are refused, but merging two peers' states
+            # can still push it over. A peer rejects messages over
+            # MAX_MESSAGE_BYTES, so say so loudly rather than fail quietly.
+            if self.too_big_to_sync(self.counter, self.set):
                 self.log.error("state is too big to sync (over %d bytes)", MAX_MESSAGE_BYTES)
             for peer in self.peers:
                 self.send(peer, sync)
