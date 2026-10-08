@@ -9,6 +9,8 @@ import os
 import signal
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -185,3 +187,20 @@ def test_two_starts_at_once_inside_the_supervisor(monkeypatch):
     finally:
         for pid in my_b_children():  # anything the supervisor lost track of
             os.kill(pid, signal.SIGKILL)
+
+
+def test_supervisor_serves_the_dashboard_page(run_py):
+    with urllib.request.urlopen(f"http://{HOST}:{SUPERVISOR}/", timeout=2) as page:
+        assert page.status == 200
+        assert page.headers["Content-Type"].startswith("text/html")
+        assert "<title>CRDT replicas</title>" in page.read().decode()
+
+    with pytest.raises(urllib.error.HTTPError) as missing:
+        urllib.request.urlopen(f"http://{HOST}:{SUPERVISOR}/nope", timeout=2)
+    assert missing.value.code == 404
+
+
+def test_status_tells_the_dashboard_where_each_replica_listens(run_py):
+    replicas = supervisor({"type": "status"})["replicas"]
+    for i, rid in enumerate(REPLICA_IDS):
+        assert replicas[rid]["port"] == TEST_BASE_PORT + i

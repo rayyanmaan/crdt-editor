@@ -8,7 +8,10 @@ in separate terminals with `python replica.py A` and so on.
 
 run.py is a supervisor: besides starting the replicas, it listens on
 SUPERVISOR_PORT for commands, so the dashboard and tests can crash and restart
-replicas on demand:
+replicas on demand. Open http://localhost:<SUPERVISOR_PORT>/ (8000 by default)
+in a browser for the dashboard, which this same port serves.
+
+Commands:
 
     {"v": 1, "type": "kill",  "replica": "B"}   SIGKILL, like `kill -9`
     {"v": 1, "type": "start", "replica": "B"}   start it again (new incarnation)
@@ -26,11 +29,14 @@ import sys
 
 import websockets
 from websockets.asyncio.server import serve
+from websockets.datastructures import Headers
+from websockets.http11 import Response
 
 from config import HOST, REPLICAS, SUPERVISOR_PORT
 from protocol import SUPERVISOR_TYPES, BadMessage, decode, encode
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
+DASHBOARD = os.path.join(ROOT, "dashboard.html")
 
 log = logging.getLogger("supervisor")
 
@@ -83,6 +89,7 @@ class Supervisor:
                 rid: {
                     "running": self.running(rid),
                     "pid": self.procs[rid].pid if self.running(rid) else None,
+                    "port": REPLICAS[rid],  # so the dashboard can connect to it
                 }
                 for rid in REPLICAS
             },
@@ -121,8 +128,8 @@ class Supervisor:
         try:
             for rid in REPLICAS:
                 await self.start(rid)
-            async with serve(self.handle, HOST, SUPERVISOR_PORT):
-                log.info("supervisor listening on port %d. Ctrl-C to stop.", SUPERVISOR_PORT)
+            async with serve(self.handle, HOST, SUPERVISOR_PORT, process_request=serve_dashboard):
+                log.info("dashboard: http://%s:%d/  (Ctrl-C to stop)", HOST, SUPERVISOR_PORT)
                 await stop.wait()
         finally:
             for proc in self.procs.values():
@@ -130,6 +137,22 @@ class Supervisor:
                     proc.terminate()
             for proc in self.procs.values():
                 await proc.wait()
+
+
+def serve_dashboard(connection, request):
+    """Answer a plain browser request for "/" with the dashboard page.
+
+    The same port handles websockets (the dashboard's commands) and this one
+    page. Returning None lets a websocket handshake go ahead as normal.
+    """
+    if request.headers.get("Upgrade", "").lower() == "websocket":
+        return None
+    if request.path != "/":
+        return connection.respond(404, "Not found\n")
+    with open(DASHBOARD, "rb") as f:
+        body = f.read()
+    headers = Headers([("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body)))])
+    return Response(200, "OK", headers, body)
 
 
 def main():
