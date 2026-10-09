@@ -55,7 +55,7 @@
   <p>Each panel is a separate replica process with its own copy of the state. Edits apply locally
      at once and reach the others through a full-state sync every second. Kill a replica to crash it
      (SIGKILL); restart it and it comes back empty with a new incarnation and catches up from its peers.</p>
-  <div id="error"></div>
+  <div id="error" role="status" aria-live="polite"></div>
 </header>
 <main id="replicas"></main>
 
@@ -78,7 +78,7 @@
     <section>
       <h3>OR-Set</h3>
       <form class="row add-form">
-        <input class="element" placeholder="element" maxlength="40" autocomplete="off">
+        <input class="element" placeholder="element" maxlength="40" autocomplete="off" aria-label="Element to add">
         <button class="add">Add</button>
       </form>
       <div class="chips set"></div>
@@ -100,12 +100,18 @@
 // Only reads (get_state, status) repeat.
 
 const POLL_MS = 500;
-const panels = {};      // replica id -> {el, ws, state}
-let supervisor = null;  // websocket to run.py
-let lastStatus = null;
+const STALE_MS = 2000;    // no reply for this long: stop trusting what we last saw
+const MAX_WAITING = 2;    // don't pile up reads on a replica that isn't answering
 
+const panels = {};        // replica id -> panel (see createPanel)
+let supervisor = null;    // websocket to run.py
+let lastStatus = null;    // null while run.py isn't connected
+
+// Returns whether the message was actually handed to an open socket.
 function send(ws, msg) {
-  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({v: 1, ...msg}));
+  if (!ws || ws.readyState !== WebSocket.OPEN) return false;
+  ws.send(JSON.stringify({v: 1, ...msg}));
+  return true;
 }
 
 let errorTimer = null;
@@ -113,6 +119,18 @@ function showError(text) {
   document.getElementById("error").textContent = text || "";
   clearTimeout(errorTimer);
   errorTimer = setTimeout(() => (document.getElementById("error").textContent = ""), 5000);
+}
+
+// An edit that can't be sent is reported, not queued: queueing it would
+// mean sending it later, which is a retry by another name.
+function edit(rid, msg) {
+  const p = panels[rid];
+  if (!send(p.ws, msg)) {
+    showError(`Not sent: replica ${rid} isn't connected.`);
+    return false;
+  }
+  p.waiting++;  // every command, read or edit, gets exactly one reply
+  return true;
 }
 
 // ---- supervisor -----------------------------------------------------------
@@ -125,14 +143,28 @@ function connectSupervisor() {
     if (msg.type === "error") return showError(msg.error);
     lastStatus = msg;
     for (const [rid, info] of Object.entries(msg.replicas)) {
-      if (!panels[rid]) createPanel(rid, info.port);
+      if (!panels[rid]) {
+        createPanel(rid, info.port);
+      } else if (panels[rid].port !== info.port) {
+        // The replica moved: drop the old connection and dial the new port.
+        panels[rid].port = info.port;
+        connectReplica(rid);
+      }
     }
     renderAll();
   };
   supervisor.onclose = () => {
+    // Without the supervisor we can't know which processes exist, so we
+    // stop claiming to and disable kill/restart until it's back.
+    lastStatus = null;
+    renderAll();
     showError("Lost the connection to run.py. Is it still running?");
     setTimeout(connectSupervisor, 1000);
   };
+}
+
+function supervise(rid, type) {
+  if (!send(supervisor, {type, replica: rid})) showError("Not sent: run.py isn't connected.");
 }
 
 // ---- one panel per replica ------------------------------------------------
@@ -140,37 +172,52 @@ function connectSupervisor() {
 function createPanel(rid, port) {
   const el = document.getElementById("card").content.firstElementChild.cloneNode(true);
   el.querySelector(".name").textContent = `Replica ${rid}`;
+  el.querySelector(".kill").setAttribute("aria-label", `Kill replica ${rid}`);
+  el.querySelector(".start").setAttribute("aria-label", `Restart replica ${rid}`);
+  el.querySelector(".inc").setAttribute("aria-label", `Add 1 to replica ${rid}'s counter`);
+  el.querySelector(".element").setAttribute("aria-label", `Element to add on replica ${rid}`);
   document.getElementById("replicas").appendChild(el);
-  const p = panels[rid] = {el, port, ws: null, state: null};
 
-  el.querySelector(".kill").onclick = () => send(supervisor, {type: "kill", replica: rid});
-  el.querySelector(".start").onclick = () => send(supervisor, {type: "start", replica: rid});
-  el.querySelector(".inc").onclick = () => send(p.ws, {type: "increment", amount: 1});
+  // ws:          current connection to the replica
+  // generation:  bumped on every reconnect, so events from an old socket are ignored
+  // state:       last state it sent us; lastReply: when (ms)
+  // waiting:     reads sent and not yet answered
+  // shownSet:    the set currently drawn, so chips are only rebuilt when it changes
+  panels[rid] = {el, port, ws: null, generation: 0, state: null, lastReply: 0, waiting: 0, shownSet: null};
+
+  el.querySelector(".kill").onclick = () => supervise(rid, "kill");
+  el.querySelector(".start").onclick = () => supervise(rid, "start");
+  el.querySelector(".inc").onclick = () => edit(rid, {type: "increment", amount: 1});
   el.querySelector(".add-form").onsubmit = (e) => {
     e.preventDefault();
     const input = el.querySelector(".element");
     const element = input.value.trim();
-    if (!element) return;
-    send(p.ws, {type: "add", element});
-    input.value = "";
+    if (element && edit(rid, {type: "add", element})) input.value = "";
   };
   connectReplica(rid);
 }
 
 function connectReplica(rid) {
   const p = panels[rid];
+  const generation = ++p.generation;
+  if (p.ws) p.ws.close();
   const ws = new WebSocket(`ws://${location.hostname}:${p.port}`);
   p.ws = ws;
+  p.waiting = 0;
   ws.onmessage = (e) => {
+    if (generation !== p.generation) return;
+    p.waiting = Math.max(0, p.waiting - 1);
     const msg = JSON.parse(e.data);
     if (msg.type === "error") return showError(`Replica ${rid}: ${msg.error}`);
     p.state = msg;
+    p.lastReply = Date.now();
     render(rid);
   };
   ws.onclose = () => {
+    if (generation !== p.generation) return;  // replaced on purpose, not lost
     p.state = null;
     render(rid);
-    setTimeout(() => connectReplica(rid), 1000);
+    setTimeout(() => { if (generation === p.generation) connectReplica(rid); }, 1000);
   };
 }
 
@@ -181,29 +228,37 @@ function renderAll() {
 }
 
 function render(rid) {
-  const {el, ws, state} = panels[rid];
-  const running = lastStatus ? lastStatus.replicas[rid].running : false;
-  const answering = ws && ws.readyState === WebSocket.OPEN && state;
+  const p = panels[rid];
+  const {el, ws} = p;
+  const running = lastStatus ? Boolean(lastStatus.replicas[rid]?.running) : null;
+  // Only trust state that arrived recently on an open connection: a replica
+  // that stalls keeps its socket open but stops answering.
+  const fresh = p.state && Date.now() - p.lastReply < STALE_MS;
+  const answering = Boolean(ws && ws.readyState === WebSocket.OPEN && fresh);
+  const state = answering ? p.state : null;
 
   // "running" from the supervisor only means the process exists; the replica
   // counts as up once it actually answers us.
-  const status = answering ? "up" : running ? "starting" : "down";
+  const status = answering ? "up" : running === null ? "unknown" : running ? "starting" : "down";
   const pill = el.querySelector(".status");
   pill.className = `pill status ${status}`;
   pill.textContent = status;
   el.classList.toggle("offline", !answering);
-  el.querySelector(".kill").disabled = !running;
-  el.querySelector(".start").disabled = running;
+  el.querySelector(".kill").disabled = running !== true;
+  el.querySelector(".start").disabled = running !== false;
   for (const b of el.querySelectorAll(".inc, .add, .element")) b.disabled = !answering;
 
   if (!state) {
     // A replica that isn't answering has no state we can show: a crashed
     // process knows nothing. Clear the panel rather than leave its last
     // state up, which would look like it's still working.
-    el.querySelector(".incarnation").textContent = running ? "process started, not answering yet" : "not running";
+    el.querySelector(".incarnation").textContent =
+      running === null ? "run.py not connected" :
+      running ? "process started, not answering" : "not running";
     el.querySelector(".counter").textContent = "–";
     el.querySelector(".slots").textContent = "";
     el.querySelector(".set").replaceChildren();
+    p.shownSet = null;
     el.querySelector(".tombstones").textContent = "";
     el.querySelector(".peers").replaceChildren();
     return;
@@ -214,18 +269,23 @@ function render(rid) {
   el.querySelector(".slots").textContent = Object.entries(state.slots)
     .map(([slot, n]) => `${slot} = ${n}`).join("  ·  ") || "no increments yet";
 
-  const chips = el.querySelector(".set");
-  chips.replaceChildren(...state.set.map((element) => {
-    const chip = document.createElement("span");
-    chip.className = "chip";
-    chip.append(element);  // text, not HTML: element names come from users
-    const x = document.createElement("button");
-    x.textContent = "×";
-    x.title = `remove ${element}`;
-    x.onclick = () => send(panels[rid].ws, {type: "remove", element});
-    chip.append(x);
-    return chip;
-  }));
+  // Rebuild the chips only when the set changed, so a remove button you've
+  // tabbed to keeps its keyboard focus between polls.
+  const setKey = JSON.stringify(state.set);
+  if (setKey !== p.shownSet) {
+    p.shownSet = setKey;
+    el.querySelector(".set").replaceChildren(...state.set.map((element) => {
+      const chip = document.createElement("span");
+      chip.className = "chip";
+      chip.append(element);  // text, not HTML: element names come from users
+      const x = document.createElement("button");
+      x.textContent = "×";
+      x.setAttribute("aria-label", `Remove ${element} on replica ${rid}`);
+      x.onclick = () => edit(rid, {type: "remove", element});
+      chip.append(x);
+      return chip;
+    }));
+  }
   const dead = state.set_state.removed.length;
   el.querySelector(".tombstones").textContent = `${dead} tombstone${dead === 1 ? "" : "s"}`;
 
@@ -249,7 +309,10 @@ function render(rid) {
 
 setInterval(() => {
   send(supervisor, {type: "status"});
-  for (const p of Object.values(panels)) send(p.ws, {type: "get_state"});
+  for (const p of Object.values(panels)) {
+    if (p.waiting < MAX_WAITING && send(p.ws, {type: "get_state"})) p.waiting++;
+  }
+  renderAll();  // so a replica that went quiet turns stale even with no new messages
 }, POLL_MS);
 
 connectSupervisor();

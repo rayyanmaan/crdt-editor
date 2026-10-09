@@ -32,11 +32,15 @@ from websockets.asyncio.server import serve
 from websockets.datastructures import Headers
 from websockets.http11 import Response
 
-from config import HOST, REPLICAS, SUPERVISOR_PORT
+from config import ALLOWED_ORIGINS, HOST, REPLICAS, SUPERVISOR_PORT
 from protocol import SUPERVISOR_TYPES, BadMessage, decode, encode
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-DASHBOARD = os.path.join(ROOT, "dashboard.html")
+
+# Read once at startup, so serving it never blocks on disk. Edit the file?
+# Restart run.py.
+with open(os.path.join(ROOT, "dashboard.html"), "rb") as f:
+    DASHBOARD_PAGE = f.read()
 
 log = logging.getLogger("supervisor")
 
@@ -128,7 +132,10 @@ class Supervisor:
         try:
             for rid in REPLICAS:
                 await self.start(rid)
-            async with serve(self.handle, HOST, SUPERVISOR_PORT, process_request=serve_dashboard):
+            async with serve(
+                self.handle, HOST, SUPERVISOR_PORT,
+                process_request=serve_dashboard, origins=ALLOWED_ORIGINS,
+            ):
                 log.info("dashboard: http://%s:%d/  (Ctrl-C to stop)", HOST, SUPERVISOR_PORT)
                 await stop.wait()
         finally:
@@ -147,10 +154,9 @@ def serve_dashboard(connection, request):
     """
     if request.headers.get("Upgrade", "").lower() == "websocket":
         return None
-    if request.path != "/":
+    if request.path.split("?")[0] != "/":
         return connection.respond(404, "Not found\n")
-    with open(DASHBOARD, "rb") as f:
-        body = f.read()
+    body = DASHBOARD_PAGE
     headers = Headers([("Content-Type", "text/html; charset=utf-8"), ("Content-Length", str(len(body)))])
     return Response(200, "OK", headers, body)
 

@@ -14,6 +14,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+from websockets.exceptions import InvalidStatus
 from websockets.sync.client import connect
 
 from cluster import ROOT, TEST_BASE_PORT, send_command, wait_until
@@ -204,3 +205,24 @@ def test_status_tells_the_dashboard_where_each_replica_listens(run_py):
     replicas = supervisor({"type": "status"})["replicas"]
     for i, rid in enumerate(REPLICA_IDS):
         assert replicas[rid]["port"] == TEST_BASE_PORT + i
+
+
+@pytest.mark.parametrize("origin", ["http://evil.example", "null"])
+def test_supervisor_rejects_commands_from_other_websites(run_py, origin):
+    with pytest.raises(InvalidStatus) as refused:
+        with connect(f"ws://{HOST}:{SUPERVISOR}", origin=origin, open_timeout=2) as ws:
+            ws.send(json.dumps({"v": 1, "type": "kill", "replica": "A"}))
+            ws.recv(timeout=2)
+    assert refused.value.response.status_code == 403
+    assert supervisor({"type": "status"})["replicas"]["A"]["running"]
+
+
+def test_supervisor_accepts_its_own_dashboard_page(run_py):
+    with connect(f"ws://{HOST}:{SUPERVISOR}", origin=f"http://localhost:{SUPERVISOR}") as ws:
+        ws.send(json.dumps({"v": 1, "type": "status"}))
+        assert json.loads(ws.recv(timeout=2))["type"] == "status"
+
+
+def test_dashboard_page_ignores_a_query_string(run_py):
+    with urllib.request.urlopen(f"http://{HOST}:{SUPERVISOR}/?from=bookmark", timeout=2) as page:
+        assert page.status == 200

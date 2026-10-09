@@ -33,7 +33,17 @@ RECONNECT_DELAY = 1.0
 MAX_MESSAGE_BYTES = 2**20
 
 # Port of the supervisor (run.py), which starts and kills replicas on request.
+# It also serves the dashboard page.
 SUPERVISOR_PORT = BASE_PORT - 1
+
+# Which web pages may open a websocket to a replica or the supervisor.
+# Browsers let any website connect to localhost, but they always say which
+# site the page came from (the Origin header), so we accept only the dashboard.
+# None means "no Origin header": Python clients and other replicas.
+# This stops other websites, not other programs on this machine.
+ALLOWED_ORIGINS = [None] + [
+    f"http://{host}:{SUPERVISOR_PORT}" for host in ("localhost", "127.0.0.1", "[::1]")
+]
 
 # Most messages that can wait on one outgoing link. When it's full, new
 # messages are dropped. Every sync carries the full state, so that loses

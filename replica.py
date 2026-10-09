@@ -34,7 +34,8 @@ from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
 
 from config import (
-    HOST, MAX_MESSAGE_BYTES, OUTBOX_LIMIT, RECONNECT_DELAY, REPLICAS, SUSPECT_AFTER, SYNC_INTERVAL,
+    ALLOWED_ORIGINS, HOST, MAX_MESSAGE_BYTES, OUTBOX_LIMIT, RECONNECT_DELAY, REPLICAS,
+    SUSPECT_AFTER, SYNC_INTERVAL,
 )
 from gcounter import GCounter
 from orset import ORSet
@@ -165,7 +166,12 @@ class Replica:
                 self.tags_made += 1
                 self.set = new_set
                 return {**self.state(), "tag": tag}
-            tombstoned = self.set.remove(element)
+            # A remove adds tombstones, so it makes the state bigger too.
+            new_set = self.set.merge(ORSet())
+            tombstoned = new_set.remove(element)
+            if self.too_big_to_sync(self.counter, new_set):
+                return {"type": "error", "error": "state is too big to sync"}
+            self.set = new_set
             return {**self.state(), "tombstoned": sorted(tombstoned)}
 
         return self.state()
@@ -268,7 +274,10 @@ class Replica:
 
     async def run(self):
         self.outbox = {peer: asyncio.Queue(OUTBOX_LIMIT) for peer in self.peers}
-        async with serve(self.handle_incoming, HOST, self.port, max_size=MAX_MESSAGE_BYTES):
+        async with serve(
+            self.handle_incoming, HOST, self.port,
+            max_size=MAX_MESSAGE_BYTES, origins=ALLOWED_ORIGINS,
+        ):
             self.log.info("listening on port %d (incarnation %d)", self.port, self.incarnation)
             await asyncio.gather(
                 self.sync_loop(),
