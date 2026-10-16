@@ -146,9 +146,17 @@ def test_delete_before_the_insert_it_deletes_is_held_back():
 
 
 # ---- every delivery order gives the same document --------------------------------
+#
+# "Every order" here means every order in which each op arrives after the
+# character it refers to. That's a superset of truly causal orders (it
+# ignores the order one replica made its own ops in), which is fine: this
+# data structure only needs the reference to be there.
 
 def causal_orders(ops):
-    """Every order of `ops` in which each op arrives after what it refers to."""
+    """Every order of `ops` in which each op arrives after what it refers to.
+
+    References to characters outside `ops` are assumed to be there already.
+    """
     made_by = {tuple(op["id"]): i for i, op in enumerate(ops) if op["kind"] == "insert"}
 
     def needs(op):
@@ -171,7 +179,7 @@ def causal_orders(ops):
     yield from extend([], set())
 
 
-def test_every_causal_delivery_order_gives_the_same_document():
+def test_every_reference_respecting_order_gives_the_same_document():
     # Three replicas start from the same "ab", then edit concurrently:
     # inserts at the same spot, an insert after a character someone else
     # deletes, and a chain of typing.
@@ -203,6 +211,7 @@ def test_every_causal_delivery_order_gives_the_same_document():
     # 7 ops where only "y" must come after "x": 7!/2 = 2520 orders.
     assert count == 2520
     assert len(results) == 1, "different delivery orders gave different documents"
+    check_nothing_lost(doc.state(), concurrent, already=base_ops)  # and it's complete
 
 
 # ---- random editing histories ------------------------------------------------------
@@ -210,9 +219,9 @@ def test_every_causal_delivery_order_gives_the_same_document():
 def random_history(seed, replicas=3, steps=60):
     """Replicas type, delete and sync with each other at random.
 
-    Returns (replicas, every op anyone made). A sync sends one replica all
-    the ops another has applied, in the order it applied them, which is
-    always a valid causal order.
+    Returns (replicas, the ops each one applied in order, every op anyone
+    made). A sync sends one replica all the ops another has applied, in the
+    order it applied them, which always respects what each op refers to.
     """
     rng = random.Random(seed)
     docs = [RGA(f"{name}#1") for name in "ABC"[:replicas]]
@@ -249,11 +258,18 @@ def deliver_in_random_causal_order(doc, ops, rng):
         pending.remove(op)
 
 
-def check_nothing_lost(state, all_ops):
-    inserted = {tuple(op["id"]) for op in all_ops if op["kind"] == "insert"}
-    deleted = {tuple(op["target"]) for op in all_ops if op["kind"] == "delete"}
-    assert {tuple(i) for i, _, _ in state} == inserted
-    assert {tuple(i) for i, _, d in state if d} == deleted
+def check_nothing_lost(state, all_ops, already=()):
+    """The document holds exactly one node per insert, with the right
+    character, and exactly the deleted ones are tombstones."""
+    ops = list(already) + list(all_ops)
+    deleted = {tuple(op["target"]) for op in ops if op["kind"] == "delete"}
+    expected = {
+        tuple(op["id"]): (op["char"], tuple(op["id"]) in deleted)
+        for op in ops if op["kind"] == "insert"
+    }
+    actual = {tuple(i): (char, d) for i, char, d in state}
+    assert len(state) == len(actual), "an id appears twice"
+    assert actual == expected
 
 
 @pytest.mark.parametrize("seed", range(300))
@@ -311,3 +327,86 @@ def test_rejected_op_leaves_the_document_untouched():
 def test_root_is_never_visible():
     doc = RGA("A#1")
     assert doc.text() == "" and doc.state() == [] and ROOT not in [tuple(i) for i, _, _ in doc.state()]
+
+
+# ---- cases added after the Codex review -----------------------------------------------
+
+def test_three_inserts_at_the_same_spot_in_every_order():
+    replicas = [RGA(f"{name}#1") for name in "ABC"]
+    ops = [doc.insert_local(0, ch) for doc, ch in zip(replicas, "abc")]  # all id lamport 1
+    results = {repr(apply_all_and_state(order, ops)) for order in causal_orders(ops)}
+    assert len(results) == 1
+    doc = RGA("Z#1")
+    apply_all(doc, ops)
+    assert doc.text() == "cba"  # biggest id first: (1,C#1) > (1,B#1) > (1,A#1)
+
+
+def apply_all_and_state(order, ops):
+    doc = RGA("Z#1")
+    apply_all(doc, [ops[i] for i in order])
+    return doc.state()
+
+
+def test_replica_far_ahead_on_the_clock_still_converges():
+    a, b = RGA("A#1"), RGA("B#1")
+    type_text(a, "x" * 50)  # A's clock is at 50, B's at 0
+    a_ops = [{"kind": "insert", "id": [n, "A#1"], "after": None if n == 1 else [n - 1, "A#1"],
+              "char": "x"} for n in range(1, 51)]
+    b_op = b.insert_local(0, "y")  # id (1, B#1): concurrent with all of A's typing
+    apply_all(b, a_ops)
+    a.apply(b_op)
+    assert a.state() == b.state()
+    assert a.text() == "y" + "x" * 50  # (1,B#1) beats (1,A#1) at the start
+
+
+def test_backward_typing_example_converges():
+    # A types "b", then "a" in front of it (typing backwards). B types "x" at
+    # the start at the same time. Ids: b=(1,A), a=(2,A), x=(1,B).
+    a, b = RGA("A#1"), RGA("B#1")
+    a_ops = [a.insert_local(0, "b"), a.insert_local(0, "a")]
+    x = b.insert_local(0, "x")
+    apply_all(b, a_ops)
+    a.apply(x)
+    assert a.text() == b.text() == "axb"
+    # x lands between A's two characters. For two people each typing a word
+    # backwards, this is how RGA can interleave them (Milestone 4).
+
+
+def test_insert_without_an_after_field_is_rejected_everywhere():
+    op = {"kind": "insert", "id": [1, "A#1"], "char": "x"}
+    doc = RGA("Z#1")
+    for call in (validate_op, doc.apply, doc.can_apply):
+        with pytest.raises(ValueError):
+            call(op)
+
+
+def test_conflicting_duplicate_is_refused():
+    x = {"kind": "insert", "id": [1, "A#1"], "after": None, "char": "x"}
+    y = {"kind": "insert", "id": [1, "A#1"], "after": None, "char": "y"}
+    moved = {"kind": "insert", "id": [1, "A#1"], "after": None, "char": "x"}
+    doc = RGA("Z#1")
+    doc.apply(x)
+    doc.apply(moved)  # an identical duplicate is fine
+    with pytest.raises(ValueError):
+        doc.apply(y)  # same id, different character: never silently pick one
+    assert doc.text() == "x"
+    assert doc.can_apply(y)  # nothing to wait for; apply() decides
+
+
+@pytest.mark.parametrize("char", ["\ud800", "\udfff"])
+def test_lone_surrogates_are_not_characters(char):
+    with pytest.raises(ValueError):
+        validate_op({"kind": "insert", "id": [1, "A#1"], "after": None, "char": char})
+
+
+def test_characters_outside_the_basic_plane_are_one_character():
+    doc = RGA("A#1")
+    type_text(doc, "a😀b")
+    assert doc.text() == "a😀b" and len(doc) == 3
+
+
+def test_rejected_local_insert_does_not_move_the_clock():
+    doc = RGA("A#1")
+    with pytest.raises(ValueError):
+        doc.insert_local(0, "xy")
+    assert doc.clock == 0

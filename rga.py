@@ -31,10 +31,11 @@ class MissingDependency(Exception):
 
 
 class Node:
-    __slots__ = ("id", "char", "deleted")
+    __slots__ = ("id", "after", "char", "deleted")
 
-    def __init__(self, id, char):
+    def __init__(self, id, after, char):
         self.id = id
+        self.after = after  # kept so a conflicting duplicate can be spotted
         self.char = char
         self.deleted = False
 
@@ -45,8 +46,10 @@ ROOT = (0, "")  # the invisible start of the document; real IDs have lamport >= 
 class RGA:
     def __init__(self, replica):
         self.replica = replica  # "<replica>#<incarnation>", unique per run
-        self.clock = 0  # Lamport clock: bigger than every lamport we've seen
-        root = Node(ROOT, "")
+        # Lamport clock: at least every lamport of an insert applied here, so
+        # our next insert (clock + 1) gets a bigger number than all of them.
+        self.clock = 0
+        root = Node(ROOT, None, "")
         self.nodes = [root]  # document order, tombstones included
         self.by_id = {ROOT: root}
 
@@ -72,8 +75,9 @@ class RGA:
         if not 0 <= index <= len(visible):
             raise IndexError(f"insert position {index} out of range")
         after = visible[index - 1].id if index > 0 else ROOT
+        op = {"kind": "insert", "id": [self.clock + 1, self.replica], "after": encode_id(after), "char": char}
+        validate_op(op)  # before touching the clock, so a rejected insert changes nothing
         self.clock += 1
-        op = {"kind": "insert", "id": [self.clock, self.replica], "after": encode_id(after), "char": char}
         self.apply(op)
         return op
 
@@ -89,8 +93,12 @@ class RGA:
     # ---- applying any op, ours or another replica's -------------------------
 
     def can_apply(self, op):
-        """True if everything the op refers to is already here."""
+        """True if the op can be applied now: what it refers to is here, or
+        it's an insert we already have (applying it again is a no-op, or an
+        error if it conflicts, either way not something to wait for)."""
         validate_op(op)
+        if op["kind"] == "insert" and decode_id(op["id"]) in self.by_id:
+            return True
         needed = op["after"] if op["kind"] == "insert" else op["target"]
         return decode_id(needed) in self.by_id
 
@@ -104,6 +112,13 @@ class RGA:
 
     def _insert(self, id, after, char):
         if id in self.by_id:
+            existing = self.by_id[id]
+            if (existing.after, existing.char) != (after, char):
+                # Two different inserts with one id: replicas that got them in
+                # different orders would keep different ones and never agree.
+                # IDs must be unique and an op never changes, so this is a bug
+                # or a misbehaving peer. Refuse it loudly.
+                raise ValueError(f"conflicting duplicate of insert {id}")
             return  # seen it already
         if after not in self.by_id:
             raise MissingDependency(f"insert {id} goes after {after}, which isn't here yet")
@@ -121,12 +136,13 @@ class RGA:
         while i < len(self.nodes) and self.nodes[i].id > id:
             i += 1
 
-        node = Node(id, char)
+        node = Node(id, after, char)
         self.nodes.insert(i, node)
         self.by_id[id] = node
 
     def _delete(self, target):
-        if target not in self.by_id or target == ROOT:
+        # (validate_op already refuses a delete of the root.)
+        if target not in self.by_id:
             raise MissingDependency(f"delete of {target}, which isn't here yet")
         self.by_id[target].deleted = True  # a tombstone: it keeps its place
 
@@ -163,10 +179,17 @@ def validate_op(op):
     if op.get("kind") == "insert":
         if not is_id(op.get("id")):
             raise ValueError("insert needs an id [lamport >= 1, replica]")
-        if op.get("after") is not None and not is_id(op.get("after")):
+        if "after" not in op:
+            raise ValueError("insert needs 'after' (null for the start)")
+        if op["after"] is not None and not is_id(op["after"]):
             raise ValueError("insert's 'after' must be an id or null")
         if not isinstance(op.get("char"), str) or len(op["char"]) != 1:
             raise ValueError("insert's 'char' must be a single character")
+        if 0xD800 <= ord(op["char"]) <= 0xDFFF:
+            # Half of a UTF-16 pair: not a character, and can't be encoded as
+            # UTF-8. The unit of text here is one Unicode code point, so "é"
+            # typed as e + accent is two inserts.
+            raise ValueError("insert's 'char' can't be a lone surrogate")
         if op.get("after") is not None and op["after"][0] >= op["id"][0]:
             # Rule 2: an insert's lamport is bigger than the one it follows,
             # because its author had seen that character. The ordering
