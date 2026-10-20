@@ -69,10 +69,13 @@ def test_bad_messages_are_ignored_and_the_connection_keeps_working(cluster):
         '{"v": 1, "type": "sync", "from": "Z", "inc": 1, "counter": {}}',  # unknown replica
         # Each sync below is bad in exactly one way, so each tests one check.
         '{"v": 1, "type": "sync", "from": "B", "inc": 1, "counter": {"B#1": -5}, '
-        '"set": {"adds": {}, "removed": []}}',
+        '"set": {"adds": {}, "removed": []}, "vv": {}}',
         # A valid counter change with a broken set: neither may be merged.
         '{"v": 1, "type": "sync", "from": "B", "inc": 1, "counter": {"B#1": 5}, '
-        '"set": {"adds": {"x": []}, "removed": []}}',
+        '"set": {"adds": {"x": []}, "removed": []}, "vv": {}}',
+        # A valid counter and set with a broken version vector: nothing merged.
+        '{"v": 1, "type": "sync", "from": "B", "inc": 1, "counter": {"B#1": 5}, '
+        '"set": {"adds": {}, "removed": []}, "vv": {"B#1": -1}}',
         '{"v": 1, "type": "increment", "amount": 2.5}',
     ]
     with connect(f"ws://{HOST}:{cluster.port('A')}") as ws:

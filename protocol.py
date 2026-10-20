@@ -6,10 +6,10 @@ number and a type:
     {"v": 1, "type": "sync", "from": "A", "inc": 1729500000123, ...}
 
 Two kinds of message arrive at a replica:
-- From other replicas ("hello", "sync"). These also say which replica sent
+- From other replicas ("hello", "sync", "ops"). These also say which replica sent
   them ("from") and which run of that replica ("inc", the incarnation).
-- From the dashboard or the tests ("increment", "add", "remove",
-  "get_state"). These get a reply on the same connection.
+- From the dashboard or the tests ("increment", "add", "remove", "insert",
+  "delete", "get_state"). These get a reply on the same connection.
 
 The supervisor (run.py) uses the same format for its own commands ("start",
 "kill", "status").
@@ -25,8 +25,8 @@ import json
 
 VERSION = 1
 
-PEER_TYPES = {"hello", "sync"}
-COMMAND_TYPES = {"increment", "add", "remove", "get_state"}
+PEER_TYPES = {"hello", "sync", "ops"}
+COMMAND_TYPES = {"increment", "add", "remove", "insert", "delete", "get_state"}
 SUPERVISOR_TYPES = {"start", "kill", "status"}
 
 

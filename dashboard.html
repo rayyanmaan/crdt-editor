@@ -47,13 +47,18 @@
   table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
   td { padding: 3px 0; }
   td:last-child { text-align: right; color: var(--muted); }
+  .doc { font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; background: #f7f8fa;
+         border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; min-height: 2.2em;
+         white-space: pre-wrap; word-break: break-all; }
+  .doc:empty::before { content: "(empty)"; color: var(--muted); }
 </style>
 </head>
 <body>
 <header>
   <h1>CRDT replicas</h1>
   <p>Each panel is a separate replica process with its own copy of the state. Edits apply locally
-     at once and reach the others through a full-state sync every second. Kill a replica to crash it
+     at once. Text edits are sent to the others as ops, and anything lost is re-sent by the
+     version-vector repair every second; the counter and set travel in a full-state sync. Kill a replica to crash it
      (SIGKILL); restart it and it comes back empty with a new incarnation and catches up from its peers.</p>
   <div id="error" role="status" aria-live="polite"></div>
 </header>
@@ -70,6 +75,16 @@
       </div>
     </div>
     <div class="meta incarnation"></div>
+    <section>
+      <h3>Text (RGA)</h3>
+      <div class="doc"></div>
+      <form class="row type-form" style="margin-top:8px">
+        <input class="typed" placeholder="type here" maxlength="200" autocomplete="off">
+        <button class="append">Add to end</button>
+        <button type="button" class="backspace">⌫</button>
+      </form>
+      <div class="small text-meta"></div>
+    </section>
     <section>
       <h3>G-Counter</h3>
       <div class="row"><span class="big counter">–</span><button class="inc">+1</button></div>
@@ -176,6 +191,8 @@ function createPanel(rid, port) {
   el.querySelector(".start").setAttribute("aria-label", `Restart replica ${rid}`);
   el.querySelector(".inc").setAttribute("aria-label", `Add 1 to replica ${rid}'s counter`);
   el.querySelector(".element").setAttribute("aria-label", `Element to add on replica ${rid}`);
+  el.querySelector(".typed").setAttribute("aria-label", `Text to add to the end on replica ${rid}`);
+  el.querySelector(".backspace").setAttribute("aria-label", `Delete the last character on replica ${rid}`);
   document.getElementById("replicas").appendChild(el);
 
   // ws:          current connection to the replica
@@ -188,6 +205,21 @@ function createPanel(rid, port) {
   el.querySelector(".kill").onclick = () => supervise(rid, "kill");
   el.querySelector(".start").onclick = () => supervise(rid, "start");
   el.querySelector(".inc").onclick = () => edit(rid, {type: "increment", amount: 1});
+  el.querySelector(".type-form").onsubmit = (e) => {
+    e.preventDefault();
+    const input = el.querySelector(".typed");
+    const text = input.value;
+    if (!text || !panels[rid].state) return;
+    // Positions are counted in code points on the replica; [...str] counts
+    // the same way (an emoji is one, not two as in str.length).
+    const end = [...panels[rid].state.text.text].length;
+    if (edit(rid, {type: "insert", index: end, text})) input.value = "";
+  };
+  el.querySelector(".backspace").onclick = () => {
+    const state = panels[rid].state;
+    const length = state ? [...state.text.text].length : 0;
+    if (length) edit(rid, {type: "delete", index: length - 1});
+  };
   el.querySelector(".add-form").onsubmit = (e) => {
     e.preventDefault();
     const input = el.querySelector(".element");
@@ -246,7 +278,7 @@ function render(rid) {
   el.classList.toggle("offline", !answering);
   el.querySelector(".kill").disabled = running !== true;
   el.querySelector(".start").disabled = running !== false;
-  for (const b of el.querySelectorAll(".inc, .add, .element")) b.disabled = !answering;
+  for (const b of el.querySelectorAll(".inc, .add, .element, .typed, .append, .backspace")) b.disabled = !answering;
 
   if (!state) {
     // A replica that isn't answering has no state we can show: a crashed
@@ -255,6 +287,8 @@ function render(rid) {
     el.querySelector(".incarnation").textContent =
       running === null ? "run.py not connected" :
       running ? "process started, not answering" : "not running";
+    el.querySelector(".doc").textContent = "";
+    el.querySelector(".text-meta").textContent = "";
     el.querySelector(".counter").textContent = "–";
     el.querySelector(".slots").textContent = "";
     el.querySelector(".set").replaceChildren();
@@ -265,6 +299,12 @@ function render(rid) {
   }
 
   el.querySelector(".incarnation").textContent = `incarnation ${state.incarnation}`;
+  const t = state.text;
+  el.querySelector(".doc").textContent = t.text;
+  const applied = Object.entries(t.applied).map(([origin, n]) => `${origin.split("#")[0]}#…${origin.slice(-4)}:${n}`);
+  el.querySelector(".text-meta").textContent =
+    `applied ${applied.join(" ") || "nothing yet"}  ·  ${t.buffered.length} waiting in buffer` +
+    `  ·  ${t.logged} ops in log  ·  ${t.tombstones} tombstone${t.tombstones === 1 ? "" : "s"}`;
   el.querySelector(".counter").textContent = state.counter;
   el.querySelector(".slots").textContent = Object.entries(state.slots)
     .map(([slot, n]) => `${slot} = ${n}`).join("  ·  ") || "no increments yet";

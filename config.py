@@ -45,7 +45,19 @@ ALLOWED_ORIGINS = [None] + [
     f"http://{host}:{SUPERVISOR_PORT}" for host in ("localhost", "127.0.0.1", "[::1]")
 ]
 
+# Most text ops in one message, when sending new edits or repairing a peer.
+REPAIR_BATCH = 200
+
+# Most characters one "insert" command may type at once.
+MAX_INSERT_CHARS = 1000
+
+# The causal buffer holds back text ops that arrive before what they depend
+# on. CRDT_CAUSAL_BUFFER=off turns it off, for the experiment that shows
+# replicas diverging without it. Never turn it off otherwise.
+CAUSAL_BUFFER = os.environ.get("CRDT_CAUSAL_BUFFER", "on") != "off"
+
 # Most messages that can wait on one outgoing link. When it's full, new
-# messages are dropped. Every sync carries the full state, so that loses
-# nothing that a later sync won't bring.
+# messages are dropped. Nothing is lost for good: every sync carries the full
+# counter and set, and a dropped text op shows up as a gap in our version
+# vector at the peer, which then gets it re-sent by repair.
 OUTBOX_LIMIT = 100

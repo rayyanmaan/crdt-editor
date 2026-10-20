@@ -20,8 +20,15 @@ anti-entropy: no message has to arrive, because a later sync carries
 everything an earlier one did. The same message works as a heartbeat for the
 failure detector.
 
+The text works differently, because sending a whole document every second
+would be wasteful. Each edit is sent once as an op ("ops" message). The sync
+also carries the text's version vector, and a peer that sees we're missing
+ops sends them back ("ops" again, in batches). So a lost op is repaired at
+the next sync, as long as some live replica has it. See causal.py.
+
 The dashboard and the tests also connect to the server, to send commands
-("increment", "add", "remove", "get_state") and read the replies.
+("increment", "add", "remove", "insert", "delete", "get_state") and read the
+replies.
 """
 
 import asyncio
@@ -33,9 +40,10 @@ import websockets
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
 
+from causal import CausalText
 from config import (
-    ALLOWED_ORIGINS, HOST, MAX_MESSAGE_BYTES, OUTBOX_LIMIT, RECONNECT_DELAY, REPLICAS,
-    SUSPECT_AFTER, SYNC_INTERVAL,
+    ALLOWED_ORIGINS, CAUSAL_BUFFER, HOST, MAX_INSERT_CHARS, MAX_MESSAGE_BYTES, OUTBOX_LIMIT,
+    RECONNECT_DELAY, REPAIR_BATCH, REPLICAS, SUSPECT_AFTER, SYNC_INTERVAL,
 )
 from gcounter import GCounter
 from orset import ORSet
@@ -63,6 +71,9 @@ class Replica:
         # incarnation, so a restarted replica counting n from 1 again still
         # makes tags nobody has used.
         self.tags_made = 0
+        # The shared text. Its ops are named after this run (the slot), so a
+        # restarted replica starts a fresh sequence of op numbers.
+        self.text = CausalText(self.slot, causal=CAUSAL_BUFFER)
 
         # Messages waiting to go out on each outgoing link. Filled in by run():
         # on Python 3.9 a Queue must be created inside the running event loop.
@@ -135,8 +146,27 @@ class Replica:
             except ValueError as e:
                 self.log.warning("bad sync from %s: %s", sender, e)
                 return
+            their_vector = msg.get("vv")
+            if not valid_vector(their_vector):
+                self.log.warning("bad version vector from %s", sender)
+                return
             self.counter = self.counter.merge(their_counter)
             self.set = self.set.merge(their_set)
+            # Repair: send the peer text ops it doesn't have. They go out on
+            # our own link to that peer; incoming links are receive-only.
+            missing = self.text.missing_for(their_vector, REPAIR_BATCH)
+            if missing:
+                self.send(sender, {"type": "ops", "ops": missing})
+        elif msg["type"] == "ops":
+            ops = msg.get("ops")
+            if not isinstance(ops, list) or len(ops) > REPAIR_BATCH:
+                self.log.warning("bad ops message from %s", sender)
+                return
+            for envelope in ops:
+                try:
+                    self.text.receive(envelope)
+                except ValueError as e:
+                    self.log.warning("bad op from %s: %s", sender, e)
 
     def on_command(self, msg):
         kind = msg["type"]
@@ -174,21 +204,64 @@ class Replica:
             self.set = new_set
             return {**self.state(), "tombstoned": sorted(tombstoned)}
 
-        return self.state()
+        if kind == "insert":
+            return self.on_insert(msg)
+        if kind == "delete":
+            return self.on_delete(msg)
+
+        return self.state(full=msg.get("full") is True)
+
+    def on_insert(self, msg):
+        """Type `text` starting at position `index`, one character at a time."""
+        index, text = msg.get("index"), msg.get("text")
+        if not isinstance(text, str) or not 1 <= len(text) <= MAX_INSERT_CHARS:
+            return {"type": "error", "error": f"text must be 1 to {MAX_INSERT_CHARS} characters"}
+        if not is_index(index) or index > len(self.text.text()):
+            return {"type": "error", "error": "index out of range"}
+        if any(0xD800 <= ord(ch) <= 0xDFFF for ch in text):
+            return {"type": "error", "error": "text contains a lone surrogate"}
+        # Checked everything first, so the edit happens completely or not at all.
+        envelopes = [self.text.insert(index + i, ch) for i, ch in enumerate(text)]
+        self.broadcast_ops(envelopes)
+        return {**self.state(), "ops": envelopes}
+
+    def on_delete(self, msg):
+        """Delete `count` characters starting at position `index`."""
+        index, count = msg.get("index"), msg.get("count", 1)
+        if not is_index(index) or not is_index(count) or count < 1:
+            return {"type": "error", "error": "index and count must be whole numbers, count >= 1"}
+        if index + count > len(self.text.text()):
+            return {"type": "error", "error": "range out of the text"}
+        envelopes = [self.text.delete(index) for _ in range(count)]
+        self.broadcast_ops(envelopes)
+        return {**self.state(), "ops": envelopes}
+
+    def broadcast_ops(self, envelopes):
+        """Send new ops to every peer once. If a message is lost, the peer's
+        next sync shows the gap and we send them again (repair)."""
+        for start in range(0, len(envelopes), REPAIR_BATCH):
+            batch = envelopes[start:start + REPAIR_BATCH]
+            for peer in self.peers:
+                self.send(peer, {"type": "ops", "ops": batch})
 
     def sync_message(self, counter, set_):
         """The exact message a sync sends, including the envelope fields."""
         return {
             "type": "sync", "from": self.id, "inc": self.incarnation,
             "counter": counter.to_dict(), "set": set_.to_dict(),
+            "vv": self.text.version_vector(),
         }
 
     def too_big_to_sync(self, counter, set_):
         return len(encode(self.sync_message(counter, set_))) > MAX_MESSAGE_BYTES
 
-    def state(self):
-        """Everything the dashboard and tests need to see about this replica."""
-        return {
+    def state(self, full=False):
+        """Everything the dashboard and tests need to see about this replica.
+
+        full=True adds the whole text document, tombstones included, which
+        tests use to check nothing was lost. The dashboard doesn't need it.
+        """
+        state = {
             "type": "state",
             "id": self.id,
             "incarnation": self.incarnation,
@@ -209,7 +282,11 @@ class Replica:
                 }
                 for p in self.peers
             },
+            "text": self.text.summary(),
         }
+        if full:
+            state["text_doc"] = self.text.doc.state()
+        return state
 
     # ---- sending ---------------------------------------------------------
 
@@ -283,6 +360,17 @@ class Replica:
                 self.sync_loop(),
                 *(self.keep_link_open(peer) for peer in self.peers),
             )
+
+
+def is_index(value):
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def valid_vector(vector):
+    """A version vector from a peer: {origin: count of ops with no gap}."""
+    return isinstance(vector, dict) and all(
+        isinstance(origin, str) and is_index(count) for origin, count in vector.items()
+    )
 
 
 def main():

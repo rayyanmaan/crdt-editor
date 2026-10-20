@@ -94,6 +94,7 @@ class Page:
                 status: c.querySelector('.status').textContent,
                 counter: c.querySelector('.counter').textContent,
                 set: [...c.querySelectorAll('.set .chip')].map(ch => ch.firstChild.textContent),
+                text: c.querySelector('.doc').textContent,
                 peers: Object.fromEntries([...c.querySelectorAll('.peers tr')].map(
                     tr => [tr.children[0].textContent, tr.children[1].textContent])),
                 kill: !c.querySelector('.kill').disabled,
@@ -112,6 +113,13 @@ class Page:
             const c = {self.card(rid)};
             c.querySelector('.element').value = {json.dumps(element)};
             c.querySelector('.add-form').requestSubmit();
+        }})()""")
+
+    def type(self, rid, text):
+        self.eval(f"""(() => {{
+            const c = {self.card(rid)};
+            c.querySelector('.typed').value = {json.dumps(text)};
+            c.querySelector('.type-form').requestSubmit();
         }})()""")
 
     def remove(self, rid, element):
@@ -201,3 +209,22 @@ def test_page_says_so_when_run_py_goes_away(page, run_py):  # noqa: F811
     wait_until(lambda: everywhere(page, lambda p: p["status"] in ("unknown", "down")))
     assert everywhere(page, lambda p: not p["kill"] and not p["restart"])
     assert "run.py" in page.eval("document.getElementById('error').textContent")
+
+
+def test_text_typed_in_one_panel_appears_in_every_panel(page):
+    page.type("A", "hello ")
+    wait_until(lambda: everywhere(page, lambda p: p["text"] == "hello "))
+    page.type("C", "world")
+    wait_until(lambda: everywhere(page, lambda p: p["text"] == "hello world"))
+    page.click("B", ".backspace")
+    wait_until(lambda: everywhere(page, lambda p: p["text"] == "hello worl"))
+    assert page.problems() == []
+
+
+def test_backspace_removes_a_whole_emoji(page):
+    # The browser counts an emoji as two characters (UTF-16); the replica
+    # counts one. Getting this wrong would delete the wrong character.
+    page.type("A", "a😀")
+    wait_until(lambda: everywhere(page, lambda p: p["text"] == "a😀"))
+    page.click("A", ".backspace")
+    wait_until(lambda: everywhere(page, lambda p: p["text"] == "a"))

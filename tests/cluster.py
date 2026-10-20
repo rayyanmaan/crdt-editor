@@ -21,10 +21,10 @@ TEST_BASE_PORT = 9001
 
 
 class Cluster:
-    def __init__(self, log_dir):
+    def __init__(self, log_dir, extra_env=None):
         self.log_dir = log_dir
         self.procs = {}
-        self.env = {**os.environ, "CRDT_BASE_PORT": str(TEST_BASE_PORT)}
+        self.env = {**os.environ, "CRDT_BASE_PORT": str(TEST_BASE_PORT), **(extra_env or {})}
 
     def port(self, rid):
         return TEST_BASE_PORT + REPLICA_IDS.index(rid)
@@ -78,6 +78,15 @@ class Cluster:
 
     def remove(self, rid, element):
         return self.command(rid, {"type": "remove", "element": element})
+
+    def type(self, rid, index, text):
+        return self.command(rid, {"type": "insert", "index": index, "text": text})
+
+    def delete(self, rid, index, count=1):
+        return self.command(rid, {"type": "delete", "index": index, "count": count})
+
+    def full_state(self, rid):
+        return self.command(rid, {"type": "get_state", "full": True})
 
 
 def send_command(port, msg):
