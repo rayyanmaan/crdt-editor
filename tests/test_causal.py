@@ -111,7 +111,7 @@ def test_repair_sends_exactly_what_is_missing_including_other_origins_ops():
     b.insert(2, "c")
     # C has nothing. B has all of A's ops plus its own.
     missing = b.missing_for(c.version_vector(), limit=100)
-    assert [(e["origin"], e["seq"]) for e in missing] == [("A#1", 1), ("A#1", 2), ("B#1", 1)]
+    assert sorted((e["origin"], e["seq"]) for e in missing) == [("A#1", 1), ("A#1", 2), ("B#1", 1)]
     for e in missing:
         c.receive(e)
     assert c.text() == "abc"
@@ -283,3 +283,75 @@ def test_ops_from_one_replica_are_applied_in_the_order_it_made_them():
     assert b.summary()["applied"] == {}
     b.receive(x)
     assert b.text() == "yx" and b.summary()["applied"] == {"A#1": 2}
+
+
+
+# ---- added after the Codex review of this piece -------------------------------------------
+
+def test_repair_takes_turns_between_origins_so_one_cannot_starve_the_rest():
+    # A survivor holds A's ops 2..201, but A's op 1 was lost when A crashed,
+    # so those can never be applied anywhere. It also holds one op from B.
+    a, b, survivor, newcomer = CausalText("A#1"), CausalText("B#1"), CausalText("S#1"), CausalText("N#1")
+    a_ops = [a.insert(i, "x") for i in range(201)]
+    b_op = b.insert(0, "y")
+    for e in a_ops[1:] + [b_op]:
+        survivor.receive(e)
+
+    batch = survivor.missing_for(newcomer.version_vector(), 200)
+    assert b_op in batch  # B's op isn't stuck behind A's backlog
+    for e in batch:
+        newcomer.receive(e)
+    assert newcomer.text() == "y"
+
+
+def test_ops_after_a_lost_one_wait_forever_and_say_so():
+    # The limit of repair without a disk log: if nobody got A's op 1 before A
+    # crashed, A's later ops can never be applied. They're kept, and they
+    # show up as waiting, rather than being guessed into place.
+    a, b = CausalText("A#1"), CausalText("B#1")
+    first, second = a.insert(0, "h"), a.insert(1, "i")
+    b.receive(second)  # op 1 never arrives
+    assert b.text() == ""
+    assert b.summary()["buffered"] == ["A#1:2"]
+    assert b.version_vector() == {"A#1": 0}
+
+
+def test_an_origin_whose_op_conflicts_is_stopped_and_shown_as_rejected():
+    # Two different origins can't legitimately make the same character id.
+    # (Only a clock rollback reusing an incarnation, or a bug, could do it.)
+    honest = CausalText("A#1")
+    real = honest.insert(0, "a")
+    b = CausalText("B#1")
+    b.receive(real)
+    impostor = {"origin": "A#1", "seq": 2,
+                "op": {"kind": "insert", "id": [1, "A#1"], "after": None, "char": "z"}}
+    with pytest.raises(ValueError):
+        b.receive(impostor)
+    assert "A#1" in b.summary()["rejected"]
+    assert b.text() == "a"
+
+
+def test_a_full_batch_of_the_largest_allowed_ops_fits_in_one_message():
+    from config import MAX_MESSAGE_BYTES, REPAIR_BATCH
+    from protocol import encode
+    from rga import MAX_LAMPORT, MAX_NAME
+    name = "N" * MAX_NAME
+    biggest = {"origin": name, "seq": MAX_LAMPORT,
+               "op": {"kind": "insert", "id": [MAX_LAMPORT, name], "after": [MAX_LAMPORT - 1, name], "char": "\U0010ffff"}}
+    validate_envelope(biggest)
+    message = {"type": "ops", "from": "A", "inc": MAX_LAMPORT, "ops": [biggest] * REPAIR_BATCH}
+    assert len(encode(message)) < MAX_MESSAGE_BYTES
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"origin": "A#1", "seq": 1, "op": {"kind": "delete", "target": [1, "A#1"]}, "extra": "x" * 10000},
+        {"origin": "A#1", "seq": 1, "op": {"kind": "delete", "target": [1, "A#1"], "extra": 1}},
+        {"origin": "A" * 65, "seq": 1, "op": {"kind": "delete", "target": [1, "A#1"]}},
+        {"origin": "A#1", "seq": 1, "op": {"kind": "delete", "target": [2**53, "A#1"]}},
+    ],
+)
+def test_oversized_or_padded_envelopes_are_rejected(bad):
+    with pytest.raises(ValueError):
+        validate_envelope(bad)

@@ -34,11 +34,21 @@ class Edits:
 
 
 def everyone_has(cluster, edits, replicas=REPLICA_IDS):
-    """True once every replica holds exactly these edits, with nothing waiting."""
+    """True once every replica holds exactly these edits, with nothing waiting.
+
+    Checks three things on every replica: the document (one node per insert,
+    right character, right tombstones), and that its log and its applied
+    ops cover exactly every op the edits made, origin by origin. The last
+    part catches, say, one of two deletes of the same character going missing.
+    """
+    expected = {}
+    for e in edits.envelopes:
+        expected[e["origin"]] = max(expected.get(e["origin"], 0), e["seq"])
     docs = []
     for rid in replicas:
         state = cluster.full_state(rid)
-        if state["text"]["buffered"]:
+        text = state["text"]
+        if text["buffered"] or text["have"] != expected or text["applied"] != expected:
             return False
         docs.append(state["text_doc"])
     if any(doc != docs[0] for doc in docs):
@@ -80,7 +90,7 @@ def test_restarted_replica_catches_up_and_types_right_away(cluster):
     edits.record(cluster.type("C", 0, ">"))
 
     # B comes back empty with a new incarnation, so a new origin for its ops,
-    # and types before it has caught up with anything.
+    # and types as soon as it answers, possibly before it has caught up.
     cluster.start("B")
     wait_until(lambda: cluster.state("B"))
     reply = edits.record(cluster.type("B", 0, "new"))
@@ -142,21 +152,23 @@ def cluster_without_buffer(tmp_path):
         c.stop_all()
 
 
-def test_without_the_causal_buffer_replicas_diverge_for_good(cluster_without_buffer):
-    # The experiment from the proposal, over the real network.
+def test_without_the_causal_buffer_a_replica_ends_up_wrong_for_good(cluster_without_buffer):
+    # The experiment from the proposal, over the real network. With the
+    # buffer on, the same two ops in the same order give "hi" everywhere
+    # (test_op_that_arrives_early_waits_in_the_buffer).
     c = cluster_without_buffer
     h, i = h_then_i()
-    fake_peer_sends(c, "A", [i])  # A can't place "i" and guesses
+    fake_peer_sends(c, "A", [i])
+    wait_until(lambda: text_of(c, "A") == "i")  # A couldn't place "i" and guessed
     fake_peer_sends(c, "A", [h])
 
-    # B and C get both ops from A's repair, in order, so they're right.
-    wait_until(lambda: text_of(c, "B") == "hi" and text_of(c, "C") == "hi")
-    # A guessed wrong and nothing ever corrects it: the ops are already in
-    # its log, so repair has nothing to send it.
-    assert text_of(c, "A") == "ih"
-    wait_until(lambda: c.state("A")["text"]["applied"] == {"X#1": 2})
+    # A has both ops, so repair has nothing to send it, and it stays wrong.
+    wait_until(lambda: c.state("A")["text"]["have"] == {"X#1": 2})
     time.sleep(2.5)  # two more rounds of sync and repair
     assert text_of(c, "A") == "ih"
+    # (B and C get the ops through repair. Whether they end up right depends
+    # on whether a repair batch reached them before or after A had "h", so
+    # the test doesn't pin them down.)
 
 
 @pytest.mark.parametrize(
@@ -171,6 +183,9 @@ def test_without_the_causal_buffer_replicas_diverge_for_good(cluster_without_buf
         {"type": "delete", "index": 0, "count": 3},  # only 2 characters there
         {"type": "delete", "index": 0, "count": 0},
         {"type": "delete", "index": "0"},
+        {"type": "delete", "index": "last", "count": 3},  # more than there is
+        {"type": "delete", "index": 0, "count": 1001},
+        {"type": "insert", "index": "start", "text": "x"},
     ],
 )
 def test_bad_edit_commands_change_nothing(cluster, command):
@@ -179,3 +194,13 @@ def test_bad_edit_commands_change_nothing(cluster, command):
     reply = cluster.command("A", command)
     assert reply["type"] == "error"
     assert cluster.full_state("A")["text_doc"] == before
+
+
+def test_end_and_last_are_worked_out_by_the_replica(cluster):
+    edits = Edits()
+    edits.record(cluster.type("A", "end", "ab"))
+    edits.record(cluster.type("A", "end", "cd"))
+    assert text_of(cluster, "A") == "abcd"
+    edits.record(cluster.delete("A", "last", count=2))
+    assert text_of(cluster, "A") == "ab"
+    wait_until(lambda: everyone_has(cluster, edits))

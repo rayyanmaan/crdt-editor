@@ -6,7 +6,7 @@ number and a type:
     {"v": 1, "type": "sync", "from": "A", "inc": 1729500000123, ...}
 
 Two kinds of message arrive at a replica:
-- From other replicas ("hello", "sync", "ops"). These also say which replica sent
+- From other replicas ("hello", "sync", "vv", "ops"). These also say which replica sent
   them ("from") and which run of that replica ("inc", the incarnation).
 - From the dashboard or the tests ("increment", "add", "remove", "insert",
   "delete", "get_state"). These get a reply on the same connection.
@@ -25,7 +25,7 @@ import json
 
 VERSION = 1
 
-PEER_TYPES = {"hello", "sync", "ops"}
+PEER_TYPES = {"hello", "sync", "vv", "ops"}
 COMMAND_TYPES = {"increment", "add", "remove", "insert", "delete", "get_state"}
 SUPERVISOR_TYPES = {"start", "kill", "status"}
 

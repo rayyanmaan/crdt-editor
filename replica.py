@@ -21,10 +21,11 @@ everything an earlier one did. The same message works as a heartbeat for the
 failure detector.
 
 The text works differently, because sending a whole document every second
-would be wasteful. Each edit is sent once as an op ("ops" message). The sync
-also carries the text's version vector, and a peer that sees we're missing
-ops sends them back ("ops" again, in batches). So a lost op is repaired at
-the next sync, as long as some live replica has it. See causal.py.
+would be wasteful. Each edit is sent once as an op ("ops" message). Every
+second, each replica also sends its text version vector ("vv" message), and
+a peer that sees we're missing ops sends them back ("ops" again, in
+batches). So a lost op is sent again a second or so later, as long as a
+live replica that can reach us has it (see causal.py for the exact limits).
 
 The dashboard and the tests also connect to the server, to send commands
 ("increment", "add", "remove", "insert", "delete", "get_state") and read the
@@ -146,12 +147,16 @@ class Replica:
             except ValueError as e:
                 self.log.warning("bad sync from %s: %s", sender, e)
                 return
+            self.counter = self.counter.merge(their_counter)
+            self.set = self.set.merge(their_set)
+        elif msg["type"] == "vv":
+            # The peer's text version vector, sent separately from the
+            # counter/set sync so that sync growing too big can't stop text
+            # repair.
             their_vector = msg.get("vv")
             if not valid_vector(their_vector):
                 self.log.warning("bad version vector from %s", sender)
                 return
-            self.counter = self.counter.merge(their_counter)
-            self.set = self.set.merge(their_set)
             # Repair: send the peer text ops it doesn't have. They go out on
             # our own link to that peer; incoming links are receive-only.
             missing = self.text.missing_for(their_vector, REPAIR_BATCH)
@@ -212,10 +217,16 @@ class Replica:
         return self.state(full=msg.get("full") is True)
 
     def on_insert(self, msg):
-        """Type `text` starting at position `index`, one character at a time."""
+        """Type `text` starting at position `index`, one character at a time.
+
+        `index` may be "end", resolved here against the current text, so two
+        quick "add to end" clicks from the dashboard can't use a stale length.
+        """
         index, text = msg.get("index"), msg.get("text")
         if not isinstance(text, str) or not 1 <= len(text) <= MAX_INSERT_CHARS:
             return {"type": "error", "error": f"text must be 1 to {MAX_INSERT_CHARS} characters"}
+        if index == "end":
+            index = len(self.text.text())
         if not is_index(index) or index > len(self.text.text()):
             return {"type": "error", "error": "index out of range"}
         if any(0xD800 <= ord(ch) <= 0xDFFF for ch in text):
@@ -226,10 +237,18 @@ class Replica:
         return {**self.state(), "ops": envelopes}
 
     def on_delete(self, msg):
-        """Delete `count` characters starting at position `index`."""
+        """Delete `count` characters starting at position `index`.
+
+        `index` may be "last": delete the last `count` characters, resolved
+        here against the current text (what the dashboard's backspace sends).
+        """
         index, count = msg.get("index"), msg.get("count", 1)
-        if not is_index(index) or not is_index(count) or count < 1:
-            return {"type": "error", "error": "index and count must be whole numbers, count >= 1"}
+        if not is_index(count) or not 1 <= count <= MAX_INSERT_CHARS:
+            return {"type": "error", "error": f"count must be 1 to {MAX_INSERT_CHARS}"}
+        if index == "last":
+            index = len(self.text.text()) - count
+        if not is_index(index):
+            return {"type": "error", "error": "index must be a whole number"}
         if index + count > len(self.text.text()):
             return {"type": "error", "error": "range out of the text"}
         envelopes = [self.text.delete(index) for _ in range(count)]
@@ -249,7 +268,6 @@ class Replica:
         return {
             "type": "sync", "from": self.id, "inc": self.incarnation,
             "counter": counter.to_dict(), "set": set_.to_dict(),
-            "vv": self.text.version_vector(),
         }
 
     def too_big_to_sync(self, counter, set_):
@@ -305,7 +323,8 @@ class Replica:
         """Keep an outgoing link to one peer alive, reconnecting forever.
 
         If a send fails, that message is lost. That's fine: the next sync
-        carries the full state again.
+        carries the full counter and set again, and a lost text op shows up
+        as a gap in the peer's version vector, so repair sends it again.
         """
         url = f"ws://{HOST}:{REPLICAS[peer]}"
         while True:
@@ -343,8 +362,10 @@ class Replica:
             # MAX_MESSAGE_BYTES, so say so loudly rather than fail quietly.
             if self.too_big_to_sync(self.counter, self.set):
                 self.log.error("state is too big to sync (over %d bytes)", MAX_MESSAGE_BYTES)
+            vector = {"type": "vv", "vv": self.text.version_vector()}
             for peer in self.peers:
                 self.send(peer, sync)
+                self.send(peer, vector)
             await asyncio.sleep(SYNC_INTERVAL)
 
     # ---- main ------------------------------------------------------------

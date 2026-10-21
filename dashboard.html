@@ -209,17 +209,13 @@ function createPanel(rid, port) {
     e.preventDefault();
     const input = el.querySelector(".typed");
     const text = input.value;
-    if (!text || !panels[rid].state) return;
-    // Positions are counted in code points on the replica; [...str] counts
-    // the same way (an emoji is one, not two as in str.length).
-    const end = [...panels[rid].state.text.text].length;
-    if (edit(rid, {type: "insert", index: end, text})) input.value = "";
+    if (!text) return;
+    // "end" and "last" are resolved by the replica against its current text.
+    // Working out a position here would use the text from the last poll,
+    // which can be out of date (another click, or a remote edit, in between).
+    if (edit(rid, {type: "insert", index: "end", text})) input.value = "";
   };
-  el.querySelector(".backspace").onclick = () => {
-    const state = panels[rid].state;
-    const length = state ? [...state.text.text].length : 0;
-    if (length) edit(rid, {type: "delete", index: length - 1});
-  };
+  el.querySelector(".backspace").onclick = () => edit(rid, {type: "delete", index: "last"});
   el.querySelector(".add-form").onsubmit = (e) => {
     e.preventDefault();
     const input = el.querySelector(".element");

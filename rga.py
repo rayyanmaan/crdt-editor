@@ -164,11 +164,20 @@ def decode_id(value):
     return ROOT if value is None else (value[0], value[1])
 
 
+MAX_LAMPORT = 2**53 - 1  # the largest whole number JavaScript (the dashboard) handles exactly
+MAX_NAME = 64  # replica names like "A#1792578628064" are far shorter
+
+
+def valid_replica_name(value):
+    return isinstance(value, str) and 0 < len(value) <= MAX_NAME
+
+
 def is_id(value):
     return (
         isinstance(value, list) and len(value) == 2
-        and isinstance(value[0], int) and not isinstance(value[0], bool) and value[0] >= 1
-        and isinstance(value[1], str) and value[1] != ""
+        and isinstance(value[0], int) and not isinstance(value[0], bool)
+        and 1 <= value[0] <= MAX_LAMPORT
+        and valid_replica_name(value[1])
     )
 
 
@@ -176,6 +185,9 @@ def validate_op(op):
     """Reject anything that isn't a well-formed op, before it touches the list."""
     if not isinstance(op, dict):
         raise ValueError("op must be an object")
+    allowed = {"insert": {"kind", "id", "after", "char"}, "delete": {"kind", "target"}}
+    if op.get("kind") in allowed and not set(op) <= allowed[op["kind"]]:
+        raise ValueError(f"unexpected fields in {op['kind']} op")
     if op.get("kind") == "insert":
         if not is_id(op.get("id")):
             raise ValueError("insert needs an id [lamport >= 1, replica]")

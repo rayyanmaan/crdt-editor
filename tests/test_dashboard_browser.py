@@ -228,3 +228,17 @@ def test_backspace_removes_a_whole_emoji(page):
     wait_until(lambda: everywhere(page, lambda p: p["text"] == "a😀"))
     page.click("A", ".backspace")
     wait_until(lambda: everywhere(page, lambda p: p["text"] == "a"))
+
+
+def test_two_quick_additions_both_land_in_order(page):
+    # Both submitted before the first reply comes back. If the page worked
+    # out "the end" itself from its last poll, both would use the same
+    # position and could come out reversed.
+    page.eval("""(() => {
+        const c = [...document.querySelectorAll('.card')].find(c => c.querySelector('.name').textContent.endsWith('A'));
+        for (const t of ["first ", "second"]) {
+            c.querySelector('.typed').value = t;
+            c.querySelector('.type-form').requestSubmit();
+        }
+    })()""")
+    wait_until(lambda: everywhere(page, lambda p: p["text"] == "first second"))

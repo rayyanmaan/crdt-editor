@@ -16,20 +16,30 @@ arrive after the character it refers to. This layer sits in between:
   here. If op 7 arrives before op 6, the vector stays at 5, so the gap is
   still visible and a peer will fill it in.
 
-Repair: replicas swap version vectors every second (in the sync message), and
-each sends back what the other is missing, in batches. Any lost op is
-eventually sent again, as long as some live replica still has it.
+"Causal" here means two things: a replica's ops are applied in the order it
+made them, and an op waits for the character it refers to. That's what RGA
+needs. It is not full causal order across all replicas (that would need each
+op to carry a summary of everything its author had seen).
+
+Repair: replicas swap version vectors every second, and each sends back what
+the other is missing, in batches, taking ops from each origin in turn. A
+lost op is sent again as long as some live replica still has it *and every
+earlier op from the same origin*, and the two replicas can eventually reach
+each other. If a replica crashes before anyone got its op 5, its ops 6 and up
+can never be applied anywhere: they wait in buffers for good. Saving ops to
+disk before sending them (Milestone 3) is what closes that gap.
 
 An op on the wire (an "envelope"):
     {"origin": "B#1001", "seq": 7, "op": {...an RGA op...}}
 
 `causal=False` turns the buffer off, for the experiment in the proposal:
-ops are applied as they arrive, and one whose character is missing is
-placed at the start of the document instead of waiting. Replicas then end
-up with different text and never recover.
+ops are applied as they arrive. An insert whose character is missing is
+guessed into the start of the document, and a delete whose character is
+missing is dropped. A replica that gets ops in the wrong order can then end
+up with different text from the others, and never recover.
 """
 
-from rga import RGA, ROOT, encode_id, validate_op
+from rga import RGA, ROOT, encode_id, valid_replica_name, validate_op
 
 
 class CausalText:
@@ -41,6 +51,9 @@ class CausalText:
         self.log = {}  # origin -> {seq: envelope}, every op we've received or made
         self.applied = {}  # origin -> highest seq applied with no gap before it
         self.buffer = {}  # (origin, seq) -> envelope, received but not applied yet
+        # Origins we've stopped applying because one of their ops conflicted
+        # with what we already have. Shown on the dashboard, so it's visible.
+        self.rejected = {}  # origin -> reason
 
     # ---- local edits -----------------------------------------------------------
 
@@ -95,11 +108,15 @@ class CausalText:
                 envelope = self.buffer[key]
                 if self._ready(envelope):
                     del self.buffer[key]
-                    # Raises if the op conflicts with one we already have
-                    # (same character id, different content). Then this
-                    # origin stays stuck at this op, which is the honest
-                    # outcome: its later ops can't be trusted either.
-                    self.doc.apply(envelope["op"])
+                    try:
+                        self.doc.apply(envelope["op"])
+                    except ValueError as e:
+                        # The op conflicts with one we already have (same
+                        # character id, different content). This origin
+                        # stops here, and its later ops stay buffered: they
+                        # can't be trusted either. Recorded so it's visible.
+                        self.rejected[envelope["origin"]] = str(e)
+                        raise
                     self.applied[envelope["origin"]] = envelope["seq"]
                     count += 1
                     progress = True
@@ -136,15 +153,27 @@ class CausalText:
         return vector
 
     def missing_for(self, their_vector, limit):
-        """Ops we have that a peer with `their_vector` doesn't, oldest first,
-        at most `limit` of them. Includes ops from every origin, not just ours."""
-        missing = []
+        """Ops we have that a peer with `their_vector` doesn't, at most `limit`.
+
+        Includes ops from every origin, not just ours. Takes one op from each
+        origin in turn (each origin's in seq order), so one origin with a big
+        backlog, or a gap nobody can fill, can't starve the others.
+        """
+        queues = []
         for origin in sorted(self.log):
             have = their_vector.get(origin, 0)
-            for seq in sorted(s for s in self.log[origin] if s > have):
-                missing.append(self.log[origin][seq])
-                if len(missing) >= limit:
-                    return missing
+            seqs = sorted(s for s in self.log[origin] if s > have)
+            if seqs:
+                queues.append([self.log[origin][s] for s in seqs])
+        missing = []
+        depth = 0
+        while len(missing) < limit and any(depth < len(q) for q in queues):
+            for queue in queues:
+                if depth < len(queue):
+                    missing.append(queue[depth])
+                    if len(missing) >= limit:
+                        break
+            depth += 1
         return missing
 
     # ---- for the dashboard and tests ---------------------------------------------
@@ -155,7 +184,9 @@ class CausalText:
     def summary(self):
         return {
             "text": self.doc.text(),
+            "have": self.version_vector(),  # received, applied or buffered
             "applied": dict(sorted(self.applied.items())),
+            "rejected": dict(sorted(self.rejected.items())),
             "buffered": sorted(f"{o}:{s}" for o, s in self.buffer),
             "logged": sum(len(ops) for ops in self.log.values()),
             "tombstones": sum(1 for n in self.doc.nodes[1:] if n.deleted),
@@ -163,9 +194,14 @@ class CausalText:
 
 
 def validate_envelope(envelope):
+    """Exactly {origin, seq, op}, with nothing extra. Together with the limits
+    in validate_op, that bounds an envelope's size, so a batch of
+    REPAIR_BATCH of them always fits in one message."""
     if not isinstance(envelope, dict):
         raise ValueError("op envelope must be an object")
-    if not isinstance(envelope.get("origin"), str) or not envelope["origin"]:
+    if set(envelope) != {"origin", "seq", "op"}:
+        raise ValueError("op envelope must have exactly origin, seq and op")
+    if not valid_replica_name(envelope["origin"]):
         raise ValueError("op envelope needs an origin")
     seq = envelope.get("seq")
     if not isinstance(seq, int) or isinstance(seq, bool) or seq < 1:
