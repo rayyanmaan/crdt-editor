@@ -8,9 +8,10 @@ Every replica runs a websocket *server* that other replicas send messages to.
 For every peer, it also opens an outgoing *client* connection and uses it only
 for sending. So between A and B there are two one-way links, A->B and B->A.
 
-One-way links are on purpose: later, the fault-injection proxy sits on a link
-and can break one direction without the other (A hears B, but B can't hear A),
-which is a realistic kind of network failure.
+One-way links are on purpose: when started by run.py, every link goes
+through the fault-injection proxy (proxy.py), which can break one direction
+without the other (A hears B, but B can't hear A), a realistic kind of
+network failure.
 
 What they say
 -------------
@@ -43,8 +44,8 @@ from websockets.asyncio.server import serve
 
 from causal import CausalText
 from config import (
-    ALLOWED_ORIGINS, CAUSAL_BUFFER, HOST, MAX_INSERT_CHARS, MAX_MESSAGE_BYTES, OUTBOX_LIMIT,
-    RECONNECT_DELAY, REPAIR_BATCH, REPLICAS, SUSPECT_AFTER, SYNC_INTERVAL,
+    ALLOWED_ORIGINS, CAUSAL_BUFFER, HOST, LINK_PORTS, MAX_INSERT_CHARS, MAX_MESSAGE_BYTES,
+    OUTBOX_LIMIT, RECONNECT_DELAY, REPAIR_BATCH, REPLICAS, SUSPECT_AFTER, SYNC_INTERVAL, USE_PROXY,
 )
 from gcounter import GCounter
 from orset import ORSet
@@ -129,9 +130,14 @@ class Replica:
             self.log.warning("ignoring message from unknown replica %r", sender)
             return
 
-        self.last_heard[sender] = time.monotonic()
-        if self.peer_incarnation.get(sender) != msg["inc"]:
-            if sender in self.peer_incarnation:
+        # Incarnations only go up (they're start times). A message from an
+        # older one is from a process that has since died, delivered late:
+        # its data is still fine to merge, but it says nothing about whether
+        # the peer is alive now, so it doesn't count as hearing from them.
+        current = self.peer_incarnation.get(sender)
+        if current is None or msg["inc"] >= current:
+            self.last_heard[sender] = time.monotonic()
+            if current is not None and msg["inc"] > current:
                 self.log.info("%s restarted (new incarnation %d)", sender, msg["inc"])
             self.peer_incarnation[sender] = msg["inc"]
 
@@ -326,7 +332,9 @@ class Replica:
         carries the full counter and set again, and a lost text op shows up
         as a gap in the peer's version vector, so repair sends it again.
         """
-        url = f"ws://{HOST}:{REPLICAS[peer]}"
+        # Through the proxy's port for this one link, or straight to the peer.
+        port = LINK_PORTS[(self.id, peer)] if USE_PROXY else REPLICAS[peer]
+        url = f"ws://{HOST}:{port}"
         while True:
             try:
                 async with connect(url) as ws:

@@ -11,17 +11,26 @@ SUPERVISOR_PORT for commands, so the dashboard and tests can crash and restart
 replicas on demand. Open http://localhost:<SUPERVISOR_PORT>/ (8000 by default)
 in a browser for the dashboard, which this same port serves.
 
+It also runs the fault-injection proxy (proxy.py): every link between
+replicas goes through it, so the network can be broken on demand.
+
 Commands:
 
     {"v": 1, "type": "kill",  "replica": "B"}   SIGKILL, like `kill -9`
     {"v": 1, "type": "start", "replica": "B"}   start it again (new incarnation)
-    {"v": 1, "type": "status"}                  which replicas are running
+    {"v": 1, "type": "link", "from": "A", "to": "B", "settings": {"drop": 0.5}}
+                                                change one one-way link
+    {"v": 1, "type": "partition", "groups": [["A"], ["B", "C"]]}
+                                                cut every link between groups
+    {"v": 1, "type": "heal"}                    every link back to normal
+    {"v": 1, "type": "status"}                  replicas and links
 
-The supervisor is only a test tool. Replicas never talk to it, and the system
-works the same without it.
+The supervisor and proxy are test tools. Replicas never talk to the
+supervisor, and without run.py they connect to each other directly.
 """
 
 import asyncio
+import contextlib
 import logging
 import os
 import signal
@@ -34,6 +43,7 @@ from websockets.http11 import Response
 
 from config import ALLOWED_ORIGINS, HOST, REPLICAS, SUPERVISOR_PORT
 from protocol import SUPERVISOR_TYPES, BadMessage, decode, encode
+from proxy import Network
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
@@ -53,6 +63,9 @@ class Supervisor:
         # could both see "not running" while the first process was still
         # launching, and start two copies.
         self.locks = {rid: asyncio.Lock() for rid in REPLICAS}
+        # The fake network. CRDT_PROXY_SEED makes its random choices repeatable.
+        seed = os.environ.get("CRDT_PROXY_SEED")
+        self.network = Network(seed=int(seed) if seed else None)
 
     def running(self, rid):
         proc = self.procs.get(rid)
@@ -63,7 +76,10 @@ class Supervisor:
             if self.running(rid):
                 return
             # cwd=ROOT so this works no matter which folder run.py is started from.
-            proc = await asyncio.create_subprocess_exec(sys.executable, "replica.py", rid, cwd=ROOT)
+            proc = await asyncio.create_subprocess_exec(
+                sys.executable, "replica.py", rid, cwd=ROOT,
+                env={**os.environ, "CRDT_PROXY": "on"},  # send through the proxy
+            )
             self.procs[rid] = proc
             log.info("started replica %s (pid %d)", rid, proc.pid)
             asyncio.ensure_future(self.report_exit(rid, proc))
@@ -97,6 +113,7 @@ class Supervisor:
                 }
                 for rid in REPLICAS
             },
+            "links": self.network.status(),
         }
 
     async def handle(self, ws):
@@ -117,6 +134,16 @@ class Supervisor:
                         await ws.send(encode({"type": "error", "error": f"no replica {rid!r}"}))
                         continue
                     await (self.start(rid) if msg["type"] == "start" else self.kill(rid))
+                try:
+                    if msg["type"] == "link":
+                        self.network.link(msg.get("from"), msg.get("to")).update(msg.get("settings"))
+                    elif msg["type"] == "partition":
+                        self.network.partition(msg.get("groups"))
+                    elif msg["type"] == "heal":
+                        self.network.heal()
+                except (ValueError, TypeError) as e:
+                    await ws.send(encode({"type": "error", "error": str(e)}))
+                    continue
                 await ws.send(encode(self.status()))
         except websockets.ConnectionClosed:
             pass
@@ -130,20 +157,27 @@ class Supervisor:
             loop.add_signal_handler(sig, stop.set)
 
         try:
-            for rid in REPLICAS:
-                await self.start(rid)
-            async with serve(
-                self.handle, HOST, SUPERVISOR_PORT,
-                process_request=serve_dashboard, origins=ALLOWED_ORIGINS,
-            ):
-                log.info("dashboard: http://%s:%d/  (Ctrl-C to stop)", HOST, SUPERVISOR_PORT)
-                await stop.wait()
+            async with contextlib.AsyncExitStack() as links:
+                # The network first, so replicas have something to connect to.
+                await self.network.serve_all(links)
+                for rid in REPLICAS:
+                    await self.start(rid)
+                await self.serve_commands(stop)
         finally:
             for proc in self.procs.values():
                 if proc.returncode is None:
                     proc.terminate()
             for proc in self.procs.values():
                 await proc.wait()
+
+    async def serve_commands(self, stop):
+        """Listen for commands (and serve the dashboard) until told to stop."""
+        async with serve(
+            self.handle, HOST, SUPERVISOR_PORT,
+            process_request=serve_dashboard, origins=ALLOWED_ORIGINS,
+        ):
+            log.info("dashboard: http://%s:%d/  (Ctrl-C to stop)", HOST, SUPERVISOR_PORT)
+            await stop.wait()
 
 
 def serve_dashboard(connection, request):

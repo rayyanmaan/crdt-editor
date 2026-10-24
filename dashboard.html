@@ -51,17 +51,44 @@
          border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; min-height: 2.2em;
          white-space: pre-wrap; word-break: break-all; }
   .doc:empty::before { content: "(empty)"; color: var(--muted); }
+  #network { max-width: 1200px; margin: 0 auto 14px; }
+  #network .row { margin-bottom: 8px; }
+  #network table { background: var(--card); border: 1px solid var(--line); border-radius: 10px; }
+  #network th, #network td { padding: 4px 10px; text-align: left; font-size: 13px; }
+  #network th { color: var(--muted); font-weight: 600; border-bottom: 1px solid var(--line); }
+  #network td:last-child { text-align: left; }
+  #network tr.broken td:first-child { color: var(--down); font-weight: 600; }
+  #network select { font: inherit; padding: 2px 4px; }
+  .table-wrap { overflow-x: auto; }
 </style>
 </head>
 <body>
 <header>
   <h1>CRDT replicas</h1>
-  <p>Each panel is a separate replica process with its own copy of the state. Edits apply locally
+  <p>Each panel is a separate replica process with its own copy of the state. Use the network
+     controls to cut off a replica, or make links lose, repeat, delay or shuffle messages. Edits apply locally
      at once. Text edits are sent to the others as ops, and anything lost is re-sent by the
      version-vector repair every second; the counter and set travel in a full-state sync. Kill a replica to crash it
      (SIGKILL); restart it and it comes back empty with a new incarnation and catches up from its peers.</p>
   <div id="error" role="status" aria-live="polite"></div>
 </header>
+<section id="network" aria-label="Network">
+  <h3>Network (every message between replicas goes through here)</h3>
+  <div class="row">
+    <button data-isolate="A">Cut off A</button>
+    <button data-isolate="B">Cut off B</button>
+    <button data-isolate="C">Cut off C</button>
+    <button id="heal">Heal network</button>
+    <span class="small" id="network-summary"></span>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Link</th><th>Cut</th><th>Drop</th><th>Duplicate</th><th>Delay</th><th>Reorder</th>
+        <th>Messages: passed · dropped · doubled · reordered</th></tr></thead>
+      <tbody id="links"></tbody>
+    </table>
+  </div>
+</section>
 <main id="replicas"></main>
 
 <template id="card">
@@ -157,6 +184,7 @@ function connectSupervisor() {
     const msg = JSON.parse(e.data);
     if (msg.type === "error") return showError(msg.error);
     lastStatus = msg;
+    if (msg.links) renderNetwork(msg.links);
     for (const [rid, info] of Object.entries(msg.replicas)) {
       if (!panels[rid]) {
         createPanel(rid, info.port);
@@ -181,6 +209,85 @@ function connectSupervisor() {
 function supervise(rid, type) {
   if (!send(supervisor, {type, replica: rid})) showError("Not sent: run.py isn't connected.");
 }
+
+// ---- the network (the proxy inside run.py) ---------------------------------
+
+const CHOICES = {
+  drop: [[0, "none"], [0.25, "25%"], [0.5, "50%"], [1, "all"]],
+  duplicate: [[0, "none"], [0.5, "50%"], [1, "all"]],
+  delay_ms: [[0, "none"], [300, "0.3 s"], [2000, "2 s"]],
+  reorder_ms: [[0, "none"], [300, "up to 0.3 s"], [1500, "up to 1.5 s"]],
+};
+const linkRows = {};  // "A>B" -> {tr, inputs}
+
+function network(msg) {
+  if (!send(supervisor, msg)) showError("Not sent: run.py isn't connected.");
+}
+
+function renderNetwork(links) {
+  const tbody = document.getElementById("links");
+  for (const [name, link] of Object.entries(links)) {
+    if (!linkRows[name]) linkRows[name] = createLinkRow(tbody, link);
+    const row = linkRows[name];
+    // Don't overwrite a control while someone is using it.
+    if (document.activeElement !== row.inputs.cut) row.inputs.cut.checked = link.cut;
+    for (const key of Object.keys(CHOICES)) {
+      if (document.activeElement !== row.inputs[key]) row.inputs[key].value = String(link[key]);
+    }
+    const broken = link.cut || link.drop > 0 || link.duplicate > 0 || link.delay_ms > 0 || link.reorder_ms > 0;
+    row.tr.classList.toggle("broken", broken);
+    row.counts.textContent = `${link.passed} · ${link.dropped} · ${link.duplicated} · ${link.reordered}`;
+  }
+  const cut = Object.keys(links).filter((n) => links[n].cut).map((n) => n.replace(">", "→"));
+  document.getElementById("network-summary").textContent =
+    cut.length ? `cut: ${cut.join(", ")}` : "all links connected";
+}
+
+function createLinkRow(tbody, link) {
+  const tr = document.createElement("tr");
+  const name = document.createElement("td");
+  name.textContent = `${link.from} → ${link.to}`;
+  tr.append(name);
+  const inputs = {};
+
+  const cutCell = document.createElement("td");
+  inputs.cut = document.createElement("input");
+  inputs.cut.type = "checkbox";
+  inputs.cut.setAttribute("aria-label", `Cut the link from ${link.from} to ${link.to}`);
+  inputs.cut.onchange = () => network({type: "link", from: link.from, to: link.to, settings: {cut: inputs.cut.checked}});
+  cutCell.append(inputs.cut);
+  tr.append(cutCell);
+
+  for (const [key, options] of Object.entries(CHOICES)) {
+    const cell = document.createElement("td");
+    const select = document.createElement("select");
+    select.setAttribute("aria-label", `${key} on the link from ${link.from} to ${link.to}`);
+    for (const [value, label] of options) {
+      const option = document.createElement("option");
+      option.value = String(value);
+      option.textContent = label;
+      select.append(option);
+    }
+    select.onchange = () => network({type: "link", from: link.from, to: link.to,
+                                     settings: {[key]: Number(select.value)}});
+    inputs[key] = select;
+    cell.append(select);
+    tr.append(cell);
+  }
+  const counts = document.createElement("td");
+  tr.append(counts);
+  tbody.append(tr);
+  return {tr, inputs, counts};
+}
+
+for (const b of document.querySelectorAll("[data-isolate]")) {
+  b.onclick = () => {
+    const alone = b.dataset.isolate;
+    const others = ["A", "B", "C"].filter((r) => r !== alone);
+    network({type: "partition", groups: [[alone], others]});
+  };
+}
+document.getElementById("heal").onclick = () => network({type: "heal"});
 
 // ---- one panel per replica ------------------------------------------------
 

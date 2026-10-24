@@ -12,7 +12,7 @@ Two kinds of message arrive at a replica:
   "delete", "get_state"). These get a reply on the same connection.
 
 The supervisor (run.py) uses the same format for its own commands ("start",
-"kill", "status").
+"kill", "link", "partition", "heal", "status").
 
 Anything that doesn't fit is rejected with BadMessage, so a malformed message
 gets logged and ignored and can't crash a replica.
@@ -27,7 +27,7 @@ VERSION = 1
 
 PEER_TYPES = {"hello", "sync", "vv", "ops"}
 COMMAND_TYPES = {"increment", "add", "remove", "insert", "delete", "get_state"}
-SUPERVISOR_TYPES = {"start", "kill", "status"}
+SUPERVISOR_TYPES = {"start", "kill", "link", "partition", "heal", "status"}
 
 
 class BadMessage(Exception):

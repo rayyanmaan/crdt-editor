@@ -36,6 +36,18 @@ MAX_MESSAGE_BYTES = 2**20
 # It also serves the dashboard page.
 SUPERVISOR_PORT = BASE_PORT - 1
 
+# The fault-injection proxy (proxy.py) has one port per one-way link, keyed
+# by (from, to): A sends to B through LINK_PORTS[("A", "B")]. run.py starts
+# the proxy and sets CRDT_PROXY=on for its replicas. Replicas started on
+# their own (python replica.py A, or the tests' Cluster) connect directly.
+LINK_PORTS = {
+    (src, dst): BASE_PORT + 10 + i
+    for i, (src, dst) in enumerate(
+        (s, d) for s in REPLICA_IDS for d in REPLICA_IDS if s != d
+    )
+}
+USE_PROXY = os.environ.get("CRDT_PROXY", "off") == "on"
+
 # Which web pages may open a websocket to a replica or the supervisor.
 # Browsers let any website connect to localhost, but they always say which
 # site the page came from (the Origin header), so we accept only the dashboard.

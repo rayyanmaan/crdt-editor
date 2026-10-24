@@ -13,6 +13,7 @@ import signal
 import socket
 import subprocess
 import time
+import time
 
 import pytest
 
@@ -242,3 +243,39 @@ def test_two_quick_additions_both_land_in_order(page):
         }
     })()""")
     wait_until(lambda: everywhere(page, lambda p: p["text"] == "first second"))
+
+
+# ---- the network controls --------------------------------------------------------------
+
+def link_row(page, src, dst):
+    return f"[...document.querySelectorAll('#links tr')].find(tr => tr.firstChild.textContent === '{src} → {dst}')"
+
+
+def test_cut_off_a_replica_edit_both_sides_then_heal(page):
+    page.eval("document.querySelector('[data-isolate=\"A\"]').click()")
+    wait_until(lambda: page.panels()["B"]["peers"]["A"] == "suspected", timeout=8)
+    assert "A→B" in page.eval("document.getElementById('network-summary').textContent")
+    assert page.eval(f"{link_row(page, 'A', 'B')}.querySelector('input').checked")
+
+    page.type("A", "left ")
+    page.type("B", "right ")
+    wait_until(lambda: page.panels()["C"]["text"] == "right ")
+    time.sleep(1.5)
+    assert page.panels()["A"]["text"] == "left "  # the two sides disagree
+
+    page.eval("document.getElementById('heal').click()")
+    wait_until(lambda: len({p["text"] for p in page.panels().values()}) == 1
+               and len(page.panels()["A"]["text"]) == len("left right "))
+    assert page.eval("document.getElementById('network-summary').textContent") == "all links connected"
+    assert page.problems() == []
+
+
+def test_a_link_set_to_drop_everything_shows_its_dropped_count(page):
+    page.eval(f"""(() => {{
+        const select = {link_row(page, 'A', 'B')}.querySelectorAll('select')[0];
+        select.value = "1";
+        select.dispatchEvent(new Event('change'));
+    }})()""")
+    wait_until(lambda: supervisor({"type": "status"})["links"]["A>B"]["drop"] == 1.0)
+    # Syncs keep flowing every second, so the dropped count climbs.
+    wait_until(lambda: int(page.eval(f"{link_row(page, 'A', 'B')}.lastChild.textContent").split(" · ")[1]) > 0)
