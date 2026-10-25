@@ -5,8 +5,9 @@ server here. Replica A sends to B by connecting to the A->B link's port; the
 link connects on to B and passes each message along, unless it has been told
 to misbehave:
 
-    cut          nothing gets through (the connection stays open, like a
-                 real network failure: the sender isn't told)
+    cut          nothing gets through, including messages already in flight
+                 (the connection stays open, like a real network failure:
+                 the sender isn't told)
     drop         this fraction of messages silently vanish (0.0 to 1.0)
     duplicate    this fraction of messages arrive twice
     delay_ms     every message arrives this much later
@@ -34,7 +35,11 @@ from config import ALLOWED_ORIGINS, HOST, LINK_PORTS, MAX_MESSAGE_BYTES, REPLICA
 log = logging.getLogger("proxy")
 
 CLEAN = {"cut": False, "drop": 0.0, "duplicate": 0.0, "delay_ms": 0, "reorder_ms": 0}
-MAX_DELAY_MS = 10_000
+MAX_DELAY_MS = 10_000  # for delay and reorder together
+
+# Most messages one link holds back at once (waiting out a delay, or for a
+# slow receiver). Beyond this, new messages are dropped rather than held.
+MAX_IN_FLIGHT = 1000
 
 
 def validate_settings(changes):
@@ -74,6 +79,10 @@ class Link:
         self.port = LINK_PORTS[(src, dst)]
         self.settings = dict(CLEAN)
         self.rng = rng
+        # Bumped every time the link is cut. A message stamped with an older
+        # number was in flight across a cut, and is lost even if the link
+        # has been healed by the time its delay is up.
+        self.cut_number = 0
         self.counts = {"passed": 0, "dropped": 0, "duplicated": 0, "reordered": 0}
 
     @property
@@ -81,7 +90,16 @@ class Link:
         return f"{self.src}>{self.dst}"
 
     def update(self, changes):
-        self.settings.update(validate_settings(changes))
+        changes = validate_settings(changes)
+        merged = {**self.settings, **changes}
+        if merged["delay_ms"] + merged["reorder_ms"] > MAX_DELAY_MS:
+            raise ValueError(f"delay plus reorder can be at most {MAX_DELAY_MS} ms")
+        if changes.get("cut") and not self.settings["cut"]:
+            self.cut_number += 1
+        if merged != self.settings:
+            changed = {k: v for k, v in merged.items() if v != self.settings[k]}
+            log.info("link %s: %s", self.name, changed)  # every fault, in run.py's output
+        self.settings = merged
 
     def status(self):
         return {"from": self.src, "to": self.dst, **self.settings, **self.counts}
@@ -98,52 +116,86 @@ class Link:
             await incoming.close()  # so the sender notices and reconnects
 
     async def pump(self, incoming, outgoing):
-        # Delayed messages are delivered by their own small tasks. They put
-        # the message on this queue when their time comes; one writer sends
-        # from the queue, so sends never overlap.
+        """Pass messages from `incoming` to `outgoing`, applying the faults.
+
+        Three things run at once, and the first to stop ends all of them:
+        reading from the sender, writing to the receiver, and watching the
+        receiver's connection (so a receiver that dies is noticed at once,
+        even if the sender has nothing to send).
+        """
+        # Copies whose delay is up wait here for the one writer, so sends
+        # never overlap. Each entry: (send number, cut number, message).
         ready = asyncio.Queue()
-        sent_count = 0
-        last_delivered = 0
+        timers = set()  # copies still waiting out their delay
+        sent = 0
+        highest_delivered = 0
 
-        async def deliver_later(number, message, delay):
+        def in_flight():
+            return ready.qsize() + len(timers)
+
+        def lost_to_a_cut(cut_number):
+            return self.settings["cut"] or cut_number != self.cut_number
+
+        async def wait_then_queue(entry, delay):
             await asyncio.sleep(delay)
-            if not self.settings["cut"]:  # cut while it was in flight: lost
-                await ready.put((number, message))
+            await ready.put(entry)
 
-        async def writer():
-            nonlocal last_delivered
-            while True:
-                number, message = await ready.get()
-                if number < last_delivered:
-                    self.counts["reordered"] += 1
-                last_delivered = max(last_delivered, number)
-                await outgoing.send(message)
-
-        writing = asyncio.ensure_future(writer())
-        pending = set()
-        try:
+        async def read():
+            nonlocal sent
             async for message in incoming:
-                sent_count += 1
+                sent += 1
                 delays = plan_delivery(self.settings, self.rng)
-                if not delays:
+                if not delays or in_flight() >= MAX_IN_FLIGHT:
+                    # Dropped by the settings, or too much is already held
+                    # back (a slow receiver, or long delays): drop rather
+                    # than hold an unbounded amount in memory.
                     self.counts["dropped"] += 1
                     continue
-                self.counts["passed"] += 1
                 if len(delays) > 1:
                     self.counts["duplicated"] += 1
                 for delay in delays:
+                    entry = (sent, self.cut_number, message)
                     if delay == 0:
-                        await ready.put((sent_count, message))
+                        await ready.put(entry)
                     else:
-                        task = asyncio.ensure_future(deliver_later(sent_count, message, delay))
-                        pending.add(task)
-                        task.add_done_callback(pending.discard)
-                if writing.done():  # the receiver went away
-                    break
+                        timer = asyncio.ensure_future(wait_then_queue(entry, delay))
+                        timers.add(timer)
+                        timer.add_done_callback(timers.discard)
+
+        async def write():
+            nonlocal highest_delivered
+            while True:
+                number, cut_number, message = await ready.get()
+                if lost_to_a_cut(cut_number):
+                    # Cut while it was in flight (or queued): lost, even if
+                    # the link has since been healed.
+                    self.counts["dropped"] += 1
+                    continue
+                await outgoing.send(message)
+                self.counts["passed"] += 1
+                # "Reordered" = delivered after a message that was sent later.
+                if number < highest_delivered:
+                    self.counts["reordered"] += 1
+                highest_delivered = max(highest_delivered, number)
+
+        tasks = [
+            asyncio.ensure_future(read()),
+            asyncio.ensure_future(write()),
+            asyncio.ensure_future(outgoing.wait_closed()),
+        ]
+        try:
+            await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         finally:
-            writing.cancel()
-            for task in pending:
+            # Whatever stopped first, stop the rest and wait for them, so no
+            # task outlives the connection and no error goes unreported.
+            for task in tasks + list(timers):
                 task.cancel()
+            results = await asyncio.gather(*tasks, *timers, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception) and not isinstance(
+                    result, (asyncio.CancelledError, websockets.WebSocketException, OSError)
+                ):
+                    log.error("link %s failed: %r", self.name, result)
 
 
 class Network:
@@ -162,20 +214,22 @@ class Network:
         return self.links[(src, dst)]
 
     def partition(self, groups):
-        """Cut every link between different groups, in both directions.
-        Links inside a group are left as they are."""
+        """Cut every link between different groups, in both directions, and
+        reconnect every link within a group. Replaces any earlier partition
+        ("cut off A" then "cut off B" leaves B alone, not everyone), but
+        keeps drop, duplicate, delay and reorder settings."""
         if (not isinstance(groups, list) or not all(isinstance(g, list) for g in groups)
                 or sorted(r for g in groups for r in g) != sorted(REPLICAS)):
             raise ValueError("groups must split every replica into lists, each exactly once")
         side = {r: i for i, group in enumerate(groups) for r in group}
         for (src, dst), link in self.links.items():
-            if side[src] != side[dst]:
-                link.update({"cut": True})
+            link.update({"cut": side[src] != side[dst]})
 
     def heal(self):
-        """Every link back to normal."""
+        """Every link's settings back to normal. (Message counts are kept,
+        and anything that was in flight across a cut stays lost.)"""
         for link in self.links.values():
-            link.settings = dict(CLEAN)
+            link.update(dict(CLEAN))
 
     def status(self):
         return {link.name: link.status() for link in self.links.values()}

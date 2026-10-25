@@ -49,6 +49,7 @@ def test_later_op_waits_for_the_earlier_one_from_the_same_origin():
     assert b.receive(first) == 3  # unblocks the two waiting ops
     assert b.text() == "abc"
     assert b.summary()["buffered"] == []
+    assert b.summary()["waited"] == 2  # the two that arrived early
 
 
 def test_version_vector_counts_only_ops_with_no_gap_before_them():

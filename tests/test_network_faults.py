@@ -133,6 +133,9 @@ def test_reordered_messages_still_converge(net):
         edits.record(net.type("B", 0, str(i % 10)))
     wait_until(lambda: everyone_has(net, edits), timeout=20)
     assert sum(link["reordered"] for link in links().values()) > 0
+    # ...and the causal buffer really had to hold some ops back, rather than
+    # everything happening to arrive in a usable order.
+    assert sum(net.state(r)["text"]["waited"] for r in REPLICA_IDS) > 0
 
 
 def test_one_way_cut_edits_still_arrive_the_long_way_round(net):
@@ -194,3 +197,25 @@ def test_restart_during_a_partition_then_heal(net):
 )
 def test_bad_network_commands_are_refused(net, command):
     assert supervisor(command)["type"] == "error"
+
+
+def test_the_demo_script_from_the_notes(net):
+    # Exactly what the Oct 29 video shows, using only what the dashboard
+    # can do (add to the end, delete from the end).
+    edits = Edits()
+    edits.record(net.type("A", "end", "The cat sat"))
+    wait_until(lambda: everyone_has(net, edits))
+
+    partition("A", "BC")
+    wait_until(lambda: peer_view(net, "B", "A") == "suspected", timeout=8)
+    edits.record(net.type("A", "end", " on the mat"))
+    edits.record(net.delete("B", "last", 3))  # delete "sat"
+    edits.record(net.type("B", "end", "slept"))
+    wait_until(lambda: text_of(net, "C") == "The cat slept")
+    assert text_of(net, "A") == "The cat sat on the mat"
+
+    heal()
+    wait_until(lambda: everyone_has(net, edits))
+    # B's "slept" goes after "cat "; A's " on the mat" was typed after the
+    # "t" of "sat", which is now a tombstone but still holds its place.
+    assert text_of(net, "A") == "The cat slept on the mat"

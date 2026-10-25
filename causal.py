@@ -54,6 +54,9 @@ class CausalText:
         # Origins we've stopped applying because one of their ops conflicted
         # with what we already have. Shown on the dashboard, so it's visible.
         self.rejected = {}  # origin -> reason
+        # How many ops have ever had to wait in the buffer, so you can see
+        # it doing its job (e.g. on the dashboard while links reorder).
+        self.waited = 0
 
     # ---- local edits -----------------------------------------------------------
 
@@ -92,7 +95,10 @@ class CausalText:
             self._apply_without_waiting(envelope)
             return 1
         self.buffer[(origin, seq)] = envelope
-        return self._drain()
+        applied = self._drain()
+        if (origin, seq) in self.buffer:
+            self.waited += 1  # it couldn't go in straight away
+        return applied
 
     def _ready(self, envelope):
         origin, seq = envelope["origin"], envelope["seq"]
@@ -188,6 +194,7 @@ class CausalText:
             "applied": dict(sorted(self.applied.items())),
             "rejected": dict(sorted(self.rejected.items())),
             "buffered": sorted(f"{o}:{s}" for o, s in self.buffer),
+            "waited": self.waited,
             "logged": sum(len(ops) for ops in self.log.values()),
             "tombstones": sum(1 for n in self.doc.nodes[1:] if n.deleted),
         }

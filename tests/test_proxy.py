@@ -74,3 +74,21 @@ def test_heal_resets_every_link():
 def test_partition_must_name_every_replica_once(groups):
     with pytest.raises(ValueError):
         Network(seed=1).partition(groups)
+
+
+def test_a_new_partition_replaces_the_old_one():
+    net = Network(seed=1)
+    net.link("A", "B").update({"drop": 0.5})
+    net.partition([["A"], ["B", "C"]])
+    net.partition([["B"], ["A", "C"]])  # "cut off A", then "cut off B"
+    cut = {name for name, link in net.status().items() if link["cut"]}
+    assert cut == {"A>B", "B>A", "B>C", "C>B"}  # only B is alone now
+    assert net.status()["A>B"]["drop"] == 0.5  # other settings kept
+
+
+def test_delay_and_reorder_together_are_capped():
+    net = Network(seed=1)
+    net.link("A", "B").update({"delay_ms": 8000})
+    with pytest.raises(ValueError):
+        net.link("A", "B").update({"reorder_ms": 3000})
+    assert net.status()["A>B"]["reorder_ms"] == 0  # the refused change left nothing behind

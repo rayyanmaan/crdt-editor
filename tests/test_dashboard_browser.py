@@ -266,7 +266,7 @@ def test_cut_off_a_replica_edit_both_sides_then_heal(page):
     page.eval("document.getElementById('heal').click()")
     wait_until(lambda: len({p["text"] for p in page.panels().values()}) == 1
                and len(page.panels()["A"]["text"]) == len("left right "))
-    assert page.eval("document.getElementById('network-summary').textContent") == "all links connected"
+    assert page.eval("document.getElementById('network-summary').textContent") == "no links cut"
     assert page.problems() == []
 
 
@@ -279,3 +279,31 @@ def test_a_link_set_to_drop_everything_shows_its_dropped_count(page):
     wait_until(lambda: supervisor({"type": "status"})["links"]["A>B"]["drop"] == 1.0)
     # Syncs keep flowing every second, so the dropped count climbs.
     wait_until(lambda: int(page.eval(f"{link_row(page, 'A', 'B')}.lastChild.textContent").split(" · ")[1]) > 0)
+
+
+
+def test_cut_checkbox_cuts_one_direction_only(page):
+    page.eval(f"""(() => {{
+        const box = {link_row(page, 'A', 'B')}.querySelector('input');
+        box.checked = true;
+        box.dispatchEvent(new Event('change'));
+    }})()""")
+    wait_until(lambda: supervisor({"type": "status"})["links"]["A>B"]["cut"] is True)
+    assert supervisor({"type": "status"})["links"]["B>A"]["cut"] is False
+    wait_until(lambda: page.panels()["B"]["peers"]["A"] == "suspected", timeout=8)
+    assert page.panels()["A"]["peers"]["B"] == "up"
+
+
+def test_a_value_set_elsewhere_is_shown_not_left_blank(page):
+    supervisor({"type": "link", "from": "C", "to": "A", "settings": {"drop": 0.3, "delay_ms": 5000}})
+    wait_until(lambda: page.eval(f"{link_row(page, 'C', 'A')}.querySelectorAll('select')[0].selectedOptions[0]?.textContent") == "30%")
+    assert page.eval(f"{link_row(page, 'C', 'A')}.querySelectorAll('select')[2].selectedOptions[0].textContent") == "5000 ms"
+    assert "other faults on: C→A" in page.eval("document.getElementById('network-summary').textContent")
+
+
+def test_network_controls_are_disabled_when_run_py_goes_away(page, run_py):  # noqa: F811
+    wait_until(lambda: page.eval("document.querySelectorAll('#links tr').length") == 6)
+    run_py.send_signal(signal.SIGTERM)
+    run_py.wait(timeout=10)
+    wait_until(lambda: page.eval("[...document.querySelectorAll('#links input, #links select')].every(e => e.disabled)"))
+    assert "unknown" in page.eval("document.getElementById('network-summary').textContent")
