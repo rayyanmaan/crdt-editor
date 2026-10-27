@@ -199,6 +199,7 @@ def test_supervisor_serves_the_dashboard_page(run_py):
     with pytest.raises(urllib.error.HTTPError) as missing:
         urllib.request.urlopen(f"http://{HOST}:{SUPERVISOR}/nope", timeout=2)
     assert missing.value.code == 404
+    missing.value.close()  # otherwise its connection stays open and slows run.py's shutdown
 
 
 def test_status_tells_the_dashboard_where_each_replica_listens(run_py):

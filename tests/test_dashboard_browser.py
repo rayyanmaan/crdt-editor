@@ -130,9 +130,17 @@ class Page:
 
 
 def all_up(panels):
-    # One read of the page, checked as a whole. (Reading it twice once let
-    # an empty page pass: all() of nothing is True.)
-    return len(panels) == 3 and all(x["status"] == "up" for x in panels.values())
+    """Every replica answers, and every replica hears every peer.
+
+    One read of the page, checked as a whole. (Reading it twice once let an
+    empty page pass: all() of nothing is True.) Waiting for the peers too
+    matters: right after startup a link may not be connected yet, and a
+    message sent then only arrives later through repair.
+    """
+    return len(panels) == 3 and all(
+        x["status"] == "up" and len(x["peers"]) == 2 and all(v == "up" for v in x["peers"].values())
+        for x in panels.values()
+    )
 
 
 @pytest.fixture
@@ -295,9 +303,9 @@ def test_cut_checkbox_cuts_one_direction_only(page):
 
 
 def test_a_value_set_elsewhere_is_shown_not_left_blank(page):
-    supervisor({"type": "link", "from": "C", "to": "A", "settings": {"drop": 0.3, "delay_ms": 5000}})
+    supervisor({"type": "link", "from": "C", "to": "A", "settings": {"drop": 0.3, "delay_ms": 4000}})
     wait_until(lambda: page.eval(f"{link_row(page, 'C', 'A')}.querySelectorAll('select')[0].selectedOptions[0]?.textContent") == "30%")
-    assert page.eval(f"{link_row(page, 'C', 'A')}.querySelectorAll('select')[2].selectedOptions[0].textContent") == "5000 ms"
+    assert page.eval(f"{link_row(page, 'C', 'A')}.querySelectorAll('select')[2].selectedOptions[0].textContent") == "4000 ms"
     assert "other faults on: C→A" in page.eval("document.getElementById('network-summary').textContent")
 
 
@@ -307,3 +315,30 @@ def test_network_controls_are_disabled_when_run_py_goes_away(page, run_py):  # n
     run_py.wait(timeout=10)
     wait_until(lambda: page.eval("[...document.querySelectorAll('#links input, #links select')].every(e => e.disabled)"))
     assert "unknown" in page.eval("document.getElementById('network-summary').textContent")
+
+
+def test_demo_step_where_an_edit_waits_in_the_buffer(page):
+    # Step 6 of the demo script, clicked the way a person would.
+    def set_select(src, dst, index, value):
+        page.eval(f"""(() => {{
+            const s = {link_row(page, src, dst)}.querySelectorAll('select')[{index}];
+            s.value = "{value}"; s.dispatchEvent(new Event('change'));
+        }})()""")
+    set_select("A", "C", 2, 5000)  # delay
+    page.eval(f"""(() => {{
+        const box = {link_row(page, 'C', 'B')}.querySelector('input');
+        box.checked = true; box.dispatchEvent(new Event('change'));
+    }})()""")
+    wait_until(lambda: supervisor({"type": "status"})["links"]["C>B"]["cut"])
+
+    page.type("A", "h")
+    time.sleep(0.7)  # moving the mouse over to B
+    wait_until(lambda: page.panels()["B"]["text"] == "h")
+    page.type("B", "i")
+
+    def c_meta():
+        return page.eval("[...document.querySelectorAll('.text-meta')][2].textContent")
+    wait_until(lambda: "1 waiting in buffer" in c_meta())
+    assert page.panels()["C"]["text"] == ""  # neither shown yet
+    wait_until(lambda: page.panels()["C"]["text"] == "hi", timeout=8)
+    assert "0 waiting in buffer (1 have waited so far)" in c_meta()
