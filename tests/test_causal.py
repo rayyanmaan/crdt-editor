@@ -287,7 +287,7 @@ def test_ops_from_one_replica_are_applied_in_the_order_it_made_them():
 
 
 
-# ---- added after the Codex review of this piece -------------------------------------------
+# ---- fairness, lost prefixes, conflicts and size limits -----------------------------------
 
 def test_repair_takes_turns_between_origins_so_one_cannot_starve_the_rest():
     # A survivor holds A's ops 2..201, but A's op 1 was lost when A crashed,

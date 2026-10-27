@@ -59,7 +59,7 @@ def test_clock_jumps_past_ids_seen_from_others():
     assert op["id"] == [6, "B#1"]  # bigger than everything B had seen
 
 
-# ---- the worked examples from NOTES.md ---------------------------------------
+# ---- the worked examples from rga.py's docstring --------------------------------
 
 def test_concurrent_inserts_at_the_same_spot_order_the_same_everywhere():
     a, b = RGA("A#1"), RGA("B#1")
@@ -329,7 +329,7 @@ def test_root_is_never_visible():
     assert doc.text() == "" and doc.state() == [] and ROOT not in [tuple(i) for i, _, _ in doc.state()]
 
 
-# ---- cases added after the Codex review -----------------------------------------------
+# ---- more edge cases ----------------------------------------------------------------------
 
 def test_three_inserts_at_the_same_spot_in_every_order():
     replicas = [RGA(f"{name}#1") for name in "ABC"]

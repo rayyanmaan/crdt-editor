@@ -2,8 +2,7 @@
 at once and still end up identical. Roh et al. (2011).
 
 This file is the data structure only. Sending ops between replicas, and
-making sure each one arrives after what it depends on, comes later. The
-rules below are written out with worked examples in NOTES.md.
+making sure each one arrives after what it depends on, is in causal.py.
 
 The ideas, in short:
 - Every character gets a permanent ID, (lamport, replica). Positions like
@@ -14,6 +13,30 @@ The ideas, in short:
   later insert that says "after it" still has somewhere to go.
 - Inserts at the same spot are ordered by ID, biggest first. Every replica
   compares IDs the same way, so every replica picks the same order.
+
+Why every replica ends up with the same order
+---------------------------------------------
+Picture the document as a tree: each character is a child of the character
+it was inserted after, and siblings are ordered biggest ID first. The list
+is that tree read top-down, each node followed by all its descendants.
+
+Inserting a new node N after P keeps the list in that order. Right after P
+come P's children, biggest first, each followed by its descendants. Every
+child bigger than N, and everything typed after it, has an ID bigger than N
+(a descendant is always created later, so its Lamport number is bigger). So
+"skip every bigger ID" passes over exactly those blocks, and the first
+smaller ID is exactly where N belongs. The tree itself doesn't depend on the
+order ops arrive in (each op names its parent, and IDs compare the same way
+everywhere), so the same ops give the same list on every replica. Deletes
+only set a flag on a node that never moves.
+
+This needs: the character an op refers to is already here (causal.py takes
+care of that), an insert's Lamport number is bigger than the one it follows,
+IDs are unique and never change, and tombstones are kept.
+
+Example: two replicas have "ac". A inserts x after "a" with ID (3, "A") and
+B inserts y after "a" with ID (3, "B"). (3, "B") is bigger, so y goes first:
+both end up with "ayxc", whichever op arrives first.
 
 Ops are plain dicts so they can be sent as JSON later:
     {"kind": "insert", "id": [3, "A#1001"], "after": [2, "A#1001"], "char": "x"}
@@ -130,8 +153,8 @@ class RGA:
         # Start just after `after`, skip every node with a bigger ID, and stop
         # at the first one with a smaller ID. The skipped nodes are inserts at
         # this same spot that win the tie-break, plus everything typed after
-        # them (which has even bigger IDs). See NOTES.md for why this gives
-        # the same order whatever order the ops arrive in.
+        # them (which has even bigger IDs). The module docstring explains why
+        # this gives the same order whatever order the ops arrive in.
         i = self.nodes.index(self.by_id[after]) + 1
         while i < len(self.nodes) and self.nodes[i].id > id:
             i += 1
@@ -205,7 +228,8 @@ def validate_op(op):
         if op.get("after") is not None and op["after"][0] >= op["id"][0]:
             # Rule 2: an insert's lamport is bigger than the one it follows,
             # because its author had seen that character. The ordering
-            # argument in NOTES.md depends on this, so reject ops that break it.
+            # argument in the module docstring depends on this, so reject ops
+            # that break it.
             raise ValueError("an insert's lamport must be bigger than the one it goes after")
     elif op.get("kind") == "delete":
         if not is_id(op.get("target")):
