@@ -51,6 +51,7 @@
          border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; min-height: 2.2em;
          white-space: pre-wrap; word-break: break-all; }
   .doc:empty::before { content: "(empty)"; color: var(--muted); }
+  .text-tombstones { font-size: 13px; margin-top: 6px; font-variant-numeric: tabular-nums; }
   #network { max-width: 1200px; margin: 0 auto 14px; }
   #network .row { margin-bottom: 8px; }
   #network table { background: var(--card); border: 1px solid var(--line); border-radius: 10px; }
@@ -110,6 +111,7 @@
         <button class="append">Add to end</button>
         <button type="button" class="backspace">⌫</button>
       </form>
+      <div class="text-tombstones"></div>
       <div class="small text-meta"></div>
     </section>
     <section>
@@ -425,6 +427,7 @@ function render(rid) {
     el.querySelector(".set").replaceChildren();
     p.shownSet = null;
     el.querySelector(".tombstones").textContent = "";
+    el.querySelector(".text-tombstones").textContent = "";
     el.querySelector(".peers").replaceChildren();
     return;
   }
@@ -436,7 +439,10 @@ function render(rid) {
   el.querySelector(".text-meta").textContent =
     `applied ${applied.join(" ") || "nothing yet"}  ·  ${t.buffered.length} waiting in buffer` +
     ` (${t.waited} have waited so far)` +
-    `  ·  ${t.logged} ops in log  ·  ${t.tombstones} tombstone${t.tombstones === 1 ? "" : "s"}`;
+    `  ·  ${t.logged} ops in log`;
+  // Its own line, so it can't be mixed up with the set's count further down.
+  el.querySelector(".text-tombstones").textContent =
+    `Deleted characters kept as tombstones: ${t.tombstones}`;
   el.querySelector(".counter").textContent = state.counter;
   el.querySelector(".slots").textContent = Object.entries(state.slots)
     .map(([slot, n]) => `${slot} = ${n}`).join("  ·  ") || "no increments yet";
@@ -459,7 +465,7 @@ function render(rid) {
     }));
   }
   const dead = state.set_state.removed.length;
-  el.querySelector(".tombstones").textContent = `${dead} tombstone${dead === 1 ? "" : "s"}`;
+  el.querySelector(".tombstones").textContent = `Removed set tags kept as tombstones: ${dead}`;
 
   el.querySelector(".peers").replaceChildren(...Object.entries(state.peers).map(([peer, info]) => {
     const tr = document.createElement("tr");

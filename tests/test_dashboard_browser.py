@@ -342,3 +342,15 @@ def test_demo_step_where_an_edit_waits_in_the_buffer(page):
     assert page.panels()["C"]["text"] == ""  # neither shown yet
     wait_until(lambda: page.panels()["C"]["text"] == "hi", timeout=8)
     assert "0 waiting in buffer (1 have waited so far)" in c_meta()
+
+
+def test_text_and_set_tombstones_are_labelled_separately(page):
+    page.type("A", "abc")
+    wait_until(lambda: everywhere(page, lambda p: p["text"] == "abc"))
+    page.click("A", ".backspace")
+    page.add("A", "x")
+    wait_until(lambda: everywhere(page, lambda p: p["text"] == "ab" and p["set"] == ["x"]))
+    card = page.card("B")
+    wait_until(lambda: page.eval(f"{card}.querySelector('.text-tombstones').textContent")
+               == "Deleted characters kept as tombstones: 1")
+    assert page.eval(f"{card}.querySelector('.tombstones').textContent") == "Removed set tags kept as tombstones: 0"
