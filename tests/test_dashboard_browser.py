@@ -286,7 +286,7 @@ def test_a_link_set_to_drop_everything_shows_its_dropped_count(page):
     }})()""")
     wait_until(lambda: supervisor({"type": "status"})["links"]["A>B"]["drop"] == 1.0)
     # Syncs keep flowing every second, so the dropped count climbs.
-    wait_until(lambda: int(page.eval(f"{link_row(page, 'A', 'B')}.lastChild.textContent").split(" · ")[1]) > 0)
+    wait_until(lambda: int(page.eval(f"{link_row(page, 'A', 'B')}.querySelector('.count-dropped').textContent")) > 0)
 
 
 

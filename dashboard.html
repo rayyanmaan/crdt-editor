@@ -57,7 +57,10 @@
   #network table { background: var(--card); border: 1px solid var(--line); border-radius: 10px; }
   #network th, #network td { padding: 4px 10px; text-align: left; font-size: 13px; }
   #network th { color: var(--muted); font-weight: 600; border-bottom: 1px solid var(--line); }
-  #network td:last-child { text-align: left; }
+  #network td:last-child { text-align: right; color: inherit; }
+  #network .center { text-align: center; }
+  #network .num { text-align: right; font-variant-numeric: tabular-nums; }
+  #network th.group { border-bottom: 1px solid var(--line); }
   #network tr.broken td:first-child { color: var(--down); font-weight: 600; }
   #network select { font: inherit; padding: 2px 4px; }
   .table-wrap { overflow-x: auto; }
@@ -84,8 +87,12 @@
   </div>
   <div class="table-wrap">
     <table>
-      <thead><tr><th>Link</th><th>Cut</th><th>Drop</th><th>Duplicate</th><th>Delay</th><th>Reorder</th>
-        <th>Messages: passed · dropped · doubled · reordered</th></tr></thead>
+      <thead>
+        <tr><th rowspan="2">Link</th><th rowspan="2" class="center">Cut</th>
+          <th rowspan="2">Drop</th><th rowspan="2">Duplicate</th><th rowspan="2">Delay</th><th rowspan="2">Reorder</th>
+          <th colspan="4" class="center group">Messages so far</th></tr>
+        <tr><th class="num">Delivered</th><th class="num">Dropped</th><th class="num">Doubled</th><th class="num">Reordered</th></tr>
+      </thead>
       <tbody id="links"></tbody>
     </table>
   </div>
@@ -253,7 +260,7 @@ function renderNetwork(links) {
     for (const input of Object.values(row.inputs)) input.disabled = false;
     const broken = link.cut || link.drop > 0 || link.duplicate > 0 || link.delay_ms > 0 || link.reorder_ms > 0;
     row.tr.classList.toggle("broken", broken);
-    row.counts.textContent = `${link.passed} · ${link.dropped} · ${link.duplicated} · ${link.reordered}`;
+    for (const [key, cell] of Object.entries(row.counts)) cell.textContent = link[key];
   }
   const cut = Object.keys(links).filter((n) => links[n].cut).map((n) => n.replace(">", "→"));
   const faulty = Object.keys(links).filter((n) => !links[n].cut && (links[n].drop > 0 ||
@@ -268,7 +275,7 @@ function networkUnknown() {
   // doing, so stop showing settings and counts as if they were current.
   for (const row of Object.values(linkRows)) {
     for (const input of Object.values(row.inputs)) input.disabled = true;
-    row.counts.textContent = "–";
+    for (const cell of Object.values(row.counts)) cell.textContent = "–";
   }
   document.getElementById("network-summary").textContent = "run.py not connected: network state unknown";
 }
@@ -281,6 +288,7 @@ function createLinkRow(tbody, link) {
   const inputs = {};
 
   const cutCell = document.createElement("td");
+  cutCell.className = "center";
   inputs.cut = document.createElement("input");
   inputs.cut.type = "checkbox";
   inputs.cut.setAttribute("aria-label", `Cut the link from ${link.from} to ${link.to}`);
@@ -304,8 +312,13 @@ function createLinkRow(tbody, link) {
     cell.append(select);
     tr.append(cell);
   }
-  const counts = document.createElement("td");
-  tr.append(counts);
+  // One cell per count, under its own column heading.
+  const counts = {};
+  for (const key of ["passed", "dropped", "duplicated", "reordered"]) {
+    counts[key] = document.createElement("td");
+    counts[key].className = `num count-${key}`;
+    tr.append(counts[key]);
+  }
   tbody.append(tr);
   return {tr, inputs, counts};
 }
