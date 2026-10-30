@@ -37,10 +37,10 @@ The network section at the top controls the links between replicas. Every messag
 
 ## Things to try
 
-1. Type "The cat sat" in A. It shows up in B and C.
+1. Type "The cat sat" in A. It shows up in B and C. Add "apple" to the set in B. It shows up in all three.
 2. Click "Cut off A". After a few seconds, A and the other two mark each other as "suspected". Nobody gets an error; the links just go quiet.
-3. While A is cut off, add " on the mat" in A. In B, delete "sat" (⌫ three times) and add "slept".
-4. Click "Heal network". All three end up with "The cat slept on the mat".
+3. While A is cut off, add " on the mat" in A. In B, delete "sat" (⌫ three times) and add "slept". Then in A, remove "apple" (×) and click +1 twice. In B, add "apple" again and click +1 once.
+4. Click "Heal network". All three end up with "The cat slept on the mat" and 3 deleted characters kept as tombstones. The counter is 3 everywhere, since each replica only adds to its own slot. "apple" is back, because when an add and a remove happen at the same time, the add wins.
 5. Kill C, type something in A, then restart C. It comes back with a new incarnation, empty, and catches up.
 6. To see the causal buffer work: set A → C to "Delay: 5 s" and tick "Cut" on C → B. Type "h" in A's box and "i" in B's box. Click Add in A, then straight away Add in B. B's "i" goes after A's "h", but C gets the "i" first (A's "h" is delayed), so C shows "1 waiting in buffer" for a few seconds until the "h" turns up. Then both appear. Click "Heal network" after. (Cutting C → B stops B from filling C in through repair, which would otherwise get there first.)
 
