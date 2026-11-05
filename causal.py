@@ -25,9 +25,10 @@ Repair: replicas swap version vectors every second, and each sends back what
 the other is missing, in batches, taking ops from each origin in turn. A
 lost op is sent again as long as some live replica still has it *and every
 earlier op from the same origin*, and the two replicas can eventually reach
-each other. If a replica crashes before anyone got its op 5, its ops 6 and up
-can never be applied anywhere: they wait in buffers for good. Saving ops to
-disk before sending them (Milestone 3) is what closes that gap.
+each other. Without a disk, a replica that crashed before anyone got its
+op 5 would leave its ops 6 and up waiting in buffers for good. Replicas now
+save every op to disk before sending it (storage.py), so a restarted replica
+still has its op 5 and repair sends it as usual.
 
 An op on the wire (an "envelope"):
     {"origin": "B#1001", "seq": 7, "op": {...an RGA op...}}

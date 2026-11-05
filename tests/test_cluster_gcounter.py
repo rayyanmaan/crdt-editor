@@ -45,11 +45,11 @@ def test_restarted_replica_catches_up_and_keeps_counting(cluster):
     a = cluster.increment("A", 1)["incarnation"]
     expected[f"A#{a}"] = 1
 
-    # B comes back empty, with a new incarnation, and counts again as soon as
-    # it's reachable (it may or may not have caught up by then). We wait with
-    # get_state and increment exactly once: retrying the increment itself
-    # could count twice.
-    cluster.start("B")
+    # B comes back empty (its disk wiped), with a new incarnation, and counts
+    # again as soon as it's reachable (it may or may not have caught up by
+    # then). We wait with get_state and increment exactly once: retrying the
+    # increment itself could count twice.
+    cluster.start("B", wipe=True)
     wait_until(lambda: cluster.state("B"))
     new_b = cluster.increment("B", 1)["incarnation"]
     assert new_b != old_b

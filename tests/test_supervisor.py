@@ -60,7 +60,7 @@ def child_pids(proc):
 
 @pytest.fixture
 def run_py(tmp_path):
-    env = {**os.environ, "CRDT_BASE_PORT": str(TEST_BASE_PORT)}
+    env = {**os.environ, "CRDT_BASE_PORT": str(TEST_BASE_PORT), "CRDT_DATA_DIR": str(tmp_path / "data")}
     with open(tmp_path / "run.log", "w") as log:
         proc = subprocess.Popen(
             [sys.executable, "run.py"], cwd=ROOT, env=env, stdout=log, stderr=subprocess.STDOUT

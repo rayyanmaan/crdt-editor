@@ -73,7 +73,7 @@
      controls to cut off a replica, or make links lose, repeat, delay or shuffle messages. Edits apply locally
      at once. Text edits are sent to the others as ops, and anything lost is re-sent by the
      version-vector repair every second; the counter and set travel in a full-state sync. Kill a replica to crash it
-     (SIGKILL); restart it and it comes back empty with a new incarnation and catches up from its peers.</p>
+     (SIGKILL); restart it and it comes back with a new incarnation, loads what it saved to disk, and catches up on the rest from its peers.</p>
   <div id="error" role="status" aria-live="polite"></div>
 </header>
 <section id="network" aria-label="Network">
@@ -445,7 +445,8 @@ function render(rid) {
     return;
   }
 
-  el.querySelector(".incarnation").textContent = `incarnation ${state.incarnation}`;
+  el.querySelector(".incarnation").textContent =
+    `incarnation ${state.incarnation} · ${state.recovered_ops} text edits loaded from disk`;
   const t = state.text;
   el.querySelector(".doc").textContent = t.text;
   const applied = Object.entries(t.applied).map(([origin, n]) => `${origin.split("#")[0]}#…${origin.slice(-4)}:${n}`);

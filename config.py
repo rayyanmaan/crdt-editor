@@ -57,6 +57,13 @@ ALLOWED_ORIGINS = [None] + [
     f"http://{host}:{SUPERVISOR_PORT}" for host in ("localhost", "127.0.0.1", "[::1]")
 ]
 
+# Where replicas save their state (storage.py), one folder per replica:
+# data/A, data/B, ... The tests point CRDT_DATA_DIR at a temporary folder.
+# `python run.py --fresh` deletes the replicas' folders to start from nothing.
+DATA_DIR = os.environ.get(
+    "CRDT_DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+)
+
 # Most text ops in one message, when sending new edits or repairing a peer.
 REPAIR_BATCH = 200
 

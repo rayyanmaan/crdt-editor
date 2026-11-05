@@ -7,6 +7,7 @@ run on ports 9001+ so they don't clash with a demo running on 8001+.
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -24,14 +25,24 @@ class Cluster:
     def __init__(self, log_dir, extra_env=None):
         self.log_dir = log_dir
         self.procs = {}
-        self.env = {**os.environ, "CRDT_BASE_PORT": str(TEST_BASE_PORT), **(extra_env or {})}
+        # Each test's replicas save to their own temporary folder, so nothing
+        # carries over from one test to the next (or from the demo).
+        self.data_dir = os.path.join(log_dir, "data")
+        self.env = {
+            **os.environ, "CRDT_BASE_PORT": str(TEST_BASE_PORT), "CRDT_DATA_DIR": self.data_dir,
+            **(extra_env or {}),
+        }
 
     def port(self, rid):
         return TEST_BASE_PORT + REPLICA_IDS.index(rid)
 
-    def start(self, rid):
+    def start(self, rid, wipe=False):
+        """Start a replica. wipe=True deletes what it saved first, as if its
+        disk was lost, so it has to get everything from its peers."""
         if rid in self.procs and self.procs[rid].poll() is None:
             raise RuntimeError(f"replica {rid} is already running")
+        if wipe:
+            shutil.rmtree(os.path.join(self.data_dir, rid), ignore_errors=True)
         # Each run of a replica gets its own log file, kept for debugging.
         # The child process keeps its own handle, so ours can be closed.
         with open(os.path.join(self.log_dir, f"{rid}-{time.time_ns()}.log"), "w") as log:

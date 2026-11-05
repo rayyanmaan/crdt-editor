@@ -89,9 +89,10 @@ def test_restarted_replica_catches_up_and_types_right_away(cluster):
     edits.record(cluster.type("A", len(text_of(cluster, "A")), "while-down "))
     edits.record(cluster.type("C", 0, ">"))
 
-    # B comes back empty with a new incarnation, so a new origin for its ops,
-    # and types as soon as it answers, possibly before it has caught up.
-    cluster.start("B")
+    # B comes back with a new incarnation, so a new origin for its ops, and
+    # types as soon as it answers, possibly before it has caught up. Its disk
+    # is wiped, so everything it had must come back from its peers.
+    cluster.start("B", wipe=True)
     wait_until(lambda: cluster.state("B"))
     reply = edits.record(cluster.type("B", 0, "new"))
     assert reply["ops"][0]["origin"] != edits.envelopes[0]["origin"]
@@ -108,7 +109,7 @@ def test_ops_from_a_dead_replica_are_recovered_from_a_third(cluster):
     # B, so C can only get them if B sends ops from other origins too.
     cluster.kill("A")
     cluster.kill("C")
-    cluster.start("C")
+    cluster.start("C", wipe=True)  # C's disk is lost too, so B is the only copy
     wait_until(lambda: everyone_has(cluster, edits, replicas=["B", "C"]))
     assert text_of(cluster, "C") == "only A typed this"
 

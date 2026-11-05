@@ -18,6 +18,14 @@ def all_links_up(cluster):
     return True
 
 
+@pytest.fixture(autouse=True)
+def replicas_save_to_a_temporary_folder(tmp_path, monkeypatch):
+    """Replica objects made inside a test save under tmp_path, never in the
+    real data/ folder. (Replica processes get CRDT_DATA_DIR from Cluster.)"""
+    import replica
+    monkeypatch.setattr(replica, "DATA_DIR", str(tmp_path / "unit-data"))
+
+
 @pytest.fixture
 def cluster(tmp_path):
     """Three running replicas, all connected. Killed after the test."""

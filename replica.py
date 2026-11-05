@@ -28,6 +28,13 @@ a peer that sees we're missing ops sends them back ("ops" again, in
 batches). So a lost op is sent again a second or so later, as long as a
 live replica that can reach us has it (see causal.py for the exact limits).
 
+Saving to disk
+--------------
+Every edit this replica accepts is written to disk (storage.py) before it is
+applied for good, sent, or confirmed, and so is every text op it receives.
+A restarted replica loads all of it back, then catches up on the rest from
+its peers as before.
+
 The dashboard and the tests also connect to the server, to send commands
 ("increment", "add", "remove", "insert", "delete", "get_state") and read the
 replies.
@@ -35,6 +42,7 @@ replies.
 
 import asyncio
 import logging
+import os
 import sys
 import time
 
@@ -42,14 +50,15 @@ import websockets
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
 
-from causal import CausalText
+from causal import CausalText, validate_envelope
 from config import (
-    ALLOWED_ORIGINS, CAUSAL_BUFFER, HOST, LINK_PORTS, MAX_INSERT_CHARS, MAX_MESSAGE_BYTES,
+    ALLOWED_ORIGINS, CAUSAL_BUFFER, DATA_DIR, HOST, LINK_PORTS, MAX_INSERT_CHARS, MAX_MESSAGE_BYTES,
     OUTBOX_LIMIT, RECONNECT_DELAY, REPAIR_BATCH, REPLICAS, SUSPECT_AFTER, SYNC_INTERVAL, USE_PROXY,
 )
 from gcounter import GCounter
 from orset import ORSet
 from protocol import COMMAND_TYPES, BadMessage, decode, encode
+from storage import Storage
 
 
 class Replica:
@@ -58,13 +67,18 @@ class Replica:
         self.port = REPLICAS[replica_id]
         self.peers = [p for p in REPLICAS if p != replica_id]
 
+        self.log = logging.getLogger(replica_id)
+
+        # Everything this replica accepts is saved here before it counts.
+        self.storage = Storage(os.path.join(DATA_DIR, replica_id))
+
         # Which run of this replica this is. A restarted replica gets a new
         # incarnation, so nothing it creates can clash with what its previous
         # run created. It only has to be unique per replica: slots are named
-        # "A#...", "B#...", so A and B may share a number. Milliseconds since
-        # 1970 is unique enough here, but it relies on the clock never going
-        # backwards. (Once state is saved to disk, this becomes a saved counter.)
-        self.incarnation = time.time_ns() // 1_000_000
+        # "A#...", "B#...", so A and B may share a number. It's saved to disk
+        # before it's used, and each run's is bigger than the last one's,
+        # even if the wall clock jumps backwards (see storage.py).
+        self.incarnation = self.storage.next_incarnation(time.time_ns() // 1_000_000)
         self.slot = f"{self.id}#{self.incarnation}"
 
         self.counter = GCounter()
@@ -76,6 +90,8 @@ class Replica:
         # The shared text. Its ops are named after this run (the slot), so a
         # restarted replica starts a fresh sequence of op numbers.
         self.text = CausalText(self.slot, causal=CAUSAL_BUFFER)
+        # What an earlier run saved: counter, set and text ops.
+        self.recovered_ops = self.recover()
 
         # Messages waiting to go out on each outgoing link. Filled in by run():
         # on Python 3.9 a Queue must be created inside the running event loop.
@@ -90,7 +106,48 @@ class Replica:
         self.last_heard = {}
         self.peer_incarnation = {}
 
-        self.log = logging.getLogger(replica_id)
+    # ---- saving to disk ----------------------------------------------------
+
+    def recover(self):
+        """Load what earlier runs saved. Returns how many text ops were loaded.
+
+        The counter and set come back as they were last saved. The text ops
+        are fed back through the causal layer, exactly as if they'd just
+        arrived from the network, which rebuilds the same document.
+        """
+        saved = self.storage.load_state()
+        if saved is not None:
+            self.counter = GCounter.from_dict(saved["counter"])
+            self.set = ORSet.from_dict(saved["set"])
+        envelopes, cut = self.storage.load_ops()
+        if cut:
+            self.log.warning("cut %d bytes of half-written log (a crash mid-write)", cut)
+        for envelope in envelopes:
+            try:
+                self.text.receive(envelope)
+            except ValueError as e:
+                self.log.warning("skipping a saved op: %s", e)
+        # Ops waiting while we replay the log aren't the network reordering
+        # anything, so they don't count towards "have waited so far".
+        self.text.waited = 0
+        if saved is not None or envelopes:
+            self.log.info("loaded %d text ops and the counter and set from disk", len(envelopes))
+        return len(envelopes)
+
+    def durably(self, write, *args):
+        """Do a disk write, or stop this replica if the disk fails.
+
+        Carrying on would mean accepting edits we can't keep. Stopping is
+        safe: on restart we load what did get saved, and peers fill in the rest.
+        """
+        try:
+            write(*args)
+        except OSError as e:
+            self.log.critical("can't write to disk (%s), stopping", e)
+            os._exit(1)
+
+    def save_counter_and_set(self, counter, set_):
+        self.durably(self.storage.save_state, {"counter": counter.to_dict(), "set": set_.to_dict()})
 
     # ---- failure detector ------------------------------------------------
 
@@ -153,8 +210,13 @@ class Replica:
             except ValueError as e:
                 self.log.warning("bad sync from %s: %s", sender, e)
                 return
-            self.counter = self.counter.merge(their_counter)
-            self.set = self.set.merge(their_set)
+            counter = self.counter.merge(their_counter)
+            set_ = self.set.merge(their_set)
+            # Save what we learned too, so we can pass it on even after a
+            # crash. Most syncs bring nothing new, and those aren't saved.
+            if counter.to_dict() != self.counter.to_dict() or set_.to_dict() != self.set.to_dict():
+                self.save_counter_and_set(counter, set_)
+            self.counter, self.set = counter, set_
         elif msg["type"] == "vv":
             # The peer's text version vector, sent separately from the
             # counter/set sync so that sync growing too big can't stop text
@@ -173,11 +235,26 @@ class Replica:
             if not isinstance(ops, list) or len(ops) > REPAIR_BATCH:
                 self.log.warning("bad ops message from %s", sender)
                 return
+            # Saved before they count, so a peer that later asks what we have
+            # is never told about ops we'd lose in a crash.
+            self.durably(self.storage.append_ops, self.new_envelopes(ops))
             for envelope in ops:
                 try:
                     self.text.receive(envelope)
                 except ValueError as e:
                     self.log.warning("bad op from %s: %s", sender, e)
+
+    def new_envelopes(self, ops):
+        """The valid ops in a batch that we don't have yet, each once."""
+        new = {}
+        for envelope in ops:
+            try:
+                validate_envelope(envelope)
+            except ValueError:
+                continue  # receive() will log it
+            if envelope["seq"] not in self.text.log.get(envelope["origin"], {}):
+                new[(envelope["origin"], envelope["seq"])] = envelope
+        return list(new.values())
 
     def on_command(self, msg):
         kind = msg["type"]
@@ -189,6 +266,8 @@ class Replica:
                 return {"type": "error", "error": str(e)}
             if self.too_big_to_sync(counter, self.set):
                 return {"type": "error", "error": "state is too big to sync"}
+            # On disk before it counts: only then do we say it worked.
+            self.save_counter_and_set(counter, self.set)
             self.counter = counter
             return self.state()
 
@@ -204,6 +283,7 @@ class Replica:
                 # and have every peer reject our syncs from then on.
                 if self.too_big_to_sync(self.counter, new_set):
                     return {"type": "error", "error": "state is too big to sync"}
+                self.save_counter_and_set(self.counter, new_set)
                 self.tags_made += 1
                 self.set = new_set
                 return {**self.state(), "tag": tag}
@@ -212,6 +292,7 @@ class Replica:
             tombstoned = new_set.remove(element)
             if self.too_big_to_sync(self.counter, new_set):
                 return {"type": "error", "error": "state is too big to sync"}
+            self.save_counter_and_set(self.counter, new_set)
             self.set = new_set
             return {**self.state(), "tombstoned": sorted(tombstoned)}
 
@@ -239,6 +320,9 @@ class Replica:
             return {"type": "error", "error": "text contains a lone surrogate"}
         # Checked everything first, so the edit happens completely or not at all.
         envelopes = [self.text.insert(index + i, ch) for i, ch in enumerate(text)]
+        # On disk before anyone hears about it. Nothing can send these ops
+        # before this line: there's no await in between.
+        self.durably(self.storage.append_ops, envelopes)
         self.broadcast_ops(envelopes)
         return {**self.state(), "ops": envelopes}
 
@@ -258,6 +342,7 @@ class Replica:
         if index + count > len(self.text.text()):
             return {"type": "error", "error": "range out of the text"}
         envelopes = [self.text.delete(index) for _ in range(count)]
+        self.durably(self.storage.append_ops, envelopes)
         self.broadcast_ops(envelopes)
         return {**self.state(), "ops": envelopes}
 
@@ -289,6 +374,7 @@ class Replica:
             "type": "state",
             "id": self.id,
             "incarnation": self.incarnation,
+            "recovered_ops": self.recovered_ops,  # text ops loaded from disk at startup
             "counter": self.counter.value(),
             "slots": self.counter.to_dict(),
             "set": self.set.elements(),

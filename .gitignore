@@ -3,3 +3,4 @@ __pycache__/
 .DS_Store
 NOTES.md
 .pytest_cache/
+data/

@@ -72,9 +72,10 @@ def test_removed_element_stays_removed_after_the_remover_crashes(cluster):
     removed = set(cluster.remove("C", "x")["tombstoned"])
     wait_until(lambda: set_state_everywhere(cluster, adds, removed))
 
-    # C crashes and comes back empty. The tombstone lives on in A and B, so
-    # the restarted C learns "x" is removed rather than bringing it back.
+    # C crashes and comes back empty (its disk wiped). The tombstone lives on
+    # in A and B, so the restarted C learns "x" is removed rather than
+    # bringing it back.
     cluster.kill("C")
-    cluster.start("C")
+    cluster.start("C", wipe=True)
     wait_until(lambda: set_state_everywhere(cluster, adds, removed))
     assert all("x" not in cluster.state(rid)["set"] for rid in REPLICA_IDS)

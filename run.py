@@ -1,6 +1,7 @@
 """Start every replica as a separate process and keep control of them.
 
-Usage:  python run.py        (Ctrl-C stops everything)
+Usage:  python run.py           (Ctrl-C stops everything)
+        python run.py --fresh   delete what the replicas saved, and start from nothing
 
 Each replica is a real OS process with its own memory, so the only way they
 can share anything is over the network. You can also start them one by one
@@ -33,6 +34,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import shutil
 import signal
 import sys
 
@@ -41,7 +43,7 @@ from websockets.asyncio.server import serve
 from websockets.datastructures import Headers
 from websockets.http11 import Response
 
-from config import ALLOWED_ORIGINS, HOST, REPLICAS, SUPERVISOR_PORT
+from config import ALLOWED_ORIGINS, DATA_DIR, HOST, REPLICAS, SUPERVISOR_PORT
 from protocol import SUPERVISOR_TYPES, BadMessage, decode, encode
 from proxy import Network
 
@@ -200,6 +202,14 @@ def main():
         level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S"
     )
     logging.getLogger("websockets").setLevel(logging.WARNING)
+    if sys.argv[1:] == ["--fresh"]:
+        # Only each replica's own folder, never the whole DATA_DIR, in case
+        # it was pointed somewhere that holds other things.
+        for rid in REPLICAS:
+            shutil.rmtree(os.path.join(DATA_DIR, rid), ignore_errors=True)
+        log.info("deleted saved state, starting fresh")
+    elif sys.argv[1:]:
+        sys.exit("usage: python run.py [--fresh]")
     asyncio.run(supervise())
 
 
