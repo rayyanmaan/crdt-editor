@@ -46,6 +46,7 @@ from websockets.http11 import Response
 from config import ALLOWED_ORIGINS, DATA_DIR, HOST, REPLICAS, SUPERVISOR_PORT
 from protocol import SUPERVISOR_TYPES, BadMessage, decode, encode
 from proxy import Network
+from storage import in_use
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 
@@ -204,9 +205,15 @@ def main():
     logging.getLogger("websockets").setLevel(logging.WARNING)
     if sys.argv[1:] == ["--fresh"]:
         # Only each replica's own folder, never the whole DATA_DIR, in case
-        # it was pointed somewhere that holds other things.
-        for rid in REPLICAS:
-            shutil.rmtree(os.path.join(DATA_DIR, rid), ignore_errors=True)
+        # it was pointed somewhere that holds other things. Refuse while a
+        # replica is running: it would keep writing to files we deleted.
+        folders = [os.path.join(DATA_DIR, rid) for rid in REPLICAS]
+        busy = [f for f in folders if in_use(f)]
+        if busy:
+            sys.exit(f"a replica is still running and using {busy[0]}; stop it first")
+        for folder in folders:
+            if os.path.exists(folder):
+                shutil.rmtree(folder)  # an error here stops us, rather than half a reset
         log.info("deleted saved state, starting fresh")
     elif sys.argv[1:]:
         sys.exit("usage: python run.py [--fresh]")

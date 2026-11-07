@@ -55,6 +55,10 @@ def test_a_replica_keeps_ops_it_received_after_their_author_is_gone(cluster):
 
 
 def test_kill_minus_9_mid_typing_loses_no_confirmed_edit(cluster):
+    # B and C are down, so the only place A can get its edits back from
+    # is its own disk.
+    cluster.kill("B")
+    cluster.kill("C")
     edits = Edits()
     stop = threading.Event()
 
@@ -82,6 +86,8 @@ def test_kill_minus_9_mid_typing_loses_no_confirmed_edit(cluster):
     assert state["text"]["have"][origin] >= confirmed
     assert state["text"]["text"].startswith("".join(e["op"]["char"] for e in edits.envelopes))
 
+    cluster.start("B")
+    cluster.start("C")
     wait_until(lambda: all_links_up(cluster))
     wait_until(lambda: len({text_of(cluster, rid) for rid in REPLICA_IDS}) == 1)
 

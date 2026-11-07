@@ -227,3 +227,31 @@ def test_supervisor_accepts_its_own_dashboard_page(run_py):
 def test_dashboard_page_ignores_a_query_string(run_py):
     with urllib.request.urlopen(f"http://{HOST}:{SUPERVISOR}/?from=bookmark", timeout=2) as page:
         assert page.status == 200
+
+
+def test_fresh_refuses_while_replicas_are_running(run_py, tmp_path):
+    env = {**os.environ, "CRDT_BASE_PORT": str(TEST_BASE_PORT), "CRDT_DATA_DIR": str(tmp_path / "data")}
+    wait_until(lambda: replica("A", {"type": "get_state"}))
+    second = subprocess.run(
+        [sys.executable, "run.py", "--fresh"], cwd=ROOT, env=env, capture_output=True, text=True, timeout=10
+    )
+    assert second.returncode != 0
+    assert "still running" in second.stderr
+    assert (tmp_path / "data" / "A" / "incarnation").exists()  # nothing deleted
+
+
+def test_fresh_deletes_saved_state_when_nothing_is_running(tmp_path):
+    data = tmp_path / "data"
+    (data / "A").mkdir(parents=True)
+    (data / "A" / "ops.log").write_text('{"x": 1}\n')
+    (data / "notes").mkdir()  # not a replica's folder: left alone
+    env = {**os.environ, "CRDT_BASE_PORT": str(TEST_BASE_PORT), "CRDT_DATA_DIR": str(data)}
+    proc = subprocess.Popen([sys.executable, "run.py", "--fresh"], cwd=ROOT, env=env,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        wait_until(lambda: replica("A", {"type": "get_state"}))
+        assert replica("A", {"type": "get_state"})["recovered_ops"] == 0
+        assert (data / "notes").exists()
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=10)

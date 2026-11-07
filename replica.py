@@ -58,6 +58,7 @@ from config import (
 from gcounter import GCounter
 from orset import ORSet
 from protocol import COMMAND_TYPES, BadMessage, decode, encode
+from rga import MAX_LAMPORT
 from storage import Storage
 
 
@@ -71,6 +72,7 @@ class Replica:
 
         # Everything this replica accepts is saved here before it counts.
         self.storage = Storage(os.path.join(DATA_DIR, replica_id))
+        self.storage.lock()  # a second copy of this replica stops here
 
         # Which run of this replica this is. A restarted replica gets a new
         # incarnation, so nothing it creates can clash with what its previous
@@ -212,6 +214,14 @@ class Replica:
                 return
             counter = self.counter.merge(their_counter)
             set_ = self.set.merge(their_set)
+            # Each side can be fine on its own but clash when merged (the
+            # same tag under two elements). Don't merge, or save, a state
+            # that we couldn't load back.
+            try:
+                ORSet.from_dict(set_.to_dict())
+            except ValueError as e:
+                self.log.warning("sync from %s clashes with our set: %s", sender, e)
+                return
             # Save what we learned too, so we can pass it on even after a
             # crash. Most syncs bring nothing new, and those aren't saved.
             if counter.to_dict() != self.counter.to_dict() or set_.to_dict() != self.set.to_dict():
@@ -245,15 +255,20 @@ class Replica:
                     self.log.warning("bad op from %s: %s", sender, e)
 
     def new_envelopes(self, ops):
-        """The valid ops in a batch that we don't have yet, each once."""
+        """The valid ops in a batch that we don't have yet, each once.
+
+        If one (origin, seq) shows up twice with different content, the first
+        is kept, the same one receive() keeps (it rejects the second).
+        """
         new = {}
         for envelope in ops:
             try:
                 validate_envelope(envelope)
             except ValueError:
                 continue  # receive() will log it
-            if envelope["seq"] not in self.text.log.get(envelope["origin"], {}):
-                new[(envelope["origin"], envelope["seq"])] = envelope
+            key = (envelope["origin"], envelope["seq"])
+            if key not in new and envelope["seq"] not in self.text.log.get(envelope["origin"], {}):
+                new[key] = envelope
         return list(new.values())
 
     def on_command(self, msg):
@@ -318,6 +333,10 @@ class Replica:
             return {"type": "error", "error": "index out of range"}
         if any(0xD800 <= ord(ch) <= 0xDFFF for ch in text):
             return {"type": "error", "error": "text contains a lone surrogate"}
+        if self.text.doc.clock + len(text) > MAX_LAMPORT:
+            # Otherwise the first characters would go in and a later one
+            # fail, leaving edits in memory that were never saved.
+            return {"type": "error", "error": "out of character ids"}
         # Checked everything first, so the edit happens completely or not at all.
         envelopes = [self.text.insert(index + i, ch) for i, ch in enumerate(text)]
         # On disk before anyone hears about it. Nothing can send these ops

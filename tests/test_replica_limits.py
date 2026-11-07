@@ -36,7 +36,9 @@ def fill_to_just_under_the_limit(r, margin):
     r.on_command({"type": "add", "element": "small"})
     # Measure the size with a one-character element, then grow that element
     # to use up all but `margin` bytes.
-    probe = Replica(r.id)
+    # The probe is another replica (a second A can't run alongside the first),
+    # given A's slot, so its messages are exactly the same size.
+    probe = Replica("B" if r.id == "A" else "A")
     probe.incarnation, probe.slot = r.incarnation, r.slot
     probe.on_command({"type": "add", "element": "small"})
     probe.on_command({"type": "add", "element": "x"})
