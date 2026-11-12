@@ -79,7 +79,9 @@ More detail is in the comments at the top of each file.
 python -m pytest
 ```
 
-There are about 1,000 tests and they take around 2.5 minutes. Most are unit tests of the CRDTs. The rest start real replica processes (and the real network) and break things on purpose: partitions, crashes, lost, duplicated and reordered messages. Those check that every edit ends up on every replica, not just that the texts match.
+There are about 1,100 tests and they take around 3 minutes. Most are unit tests of the CRDTs. The rest start real replica processes (and the real network) and break things on purpose: partitions, crashes, lost, duplicated and reordered messages. Those check that every edit ends up on every replica, not just that the texts match.
+
+`test_random_histories.py` uses Hypothesis to make up random histories: random edits on three replicas, messages delivered in any order, lost, or delivered twice, and replicas crashing and restarting from disk. After each one the network heals, and it checks that every replica is identical and that nothing anyone was told was accepted is missing. If a history fails, Hypothesis shrinks it to the shortest one that still fails.
 
 A few tests drive the dashboard in headless Chrome. They need Google Chrome and Node 22 or newer, and are skipped if either is missing.
 
@@ -95,6 +97,5 @@ One test turns the causal buffer off (`CRDT_CAUSAL_BUFFER=off`) to show what goe
 
 ## What's next
 
-- Randomized tests with Hypothesis that generate edit histories and delivery orders.
 - FugueMax, which doesn't interleave, side by side with RGA, plus a last-writer-wins version that visibly loses edits.
 - Replaying a real editing trace from the Eg-walker paper on 5 to 10 replicas and measuring convergence time, bytes sent and how much memory tombstones take.

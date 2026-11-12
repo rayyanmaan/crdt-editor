@@ -4,3 +4,4 @@ __pycache__/
 NOTES.md
 .pytest_cache/
 data/
+.hypothesis/
