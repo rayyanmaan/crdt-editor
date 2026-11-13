@@ -468,18 +468,23 @@ class Replica:
         the background, but only every 20 seconds.)
         """
         while True:
-            sync = self.sync_message(self.counter, self.set)
             # Full state only grows (tombstones are never deleted). Edits that
             # would make it too big are refused, but merging two peers' states
             # can still push it over. A peer rejects messages over
             # MAX_MESSAGE_BYTES, so say so loudly rather than fail quietly.
             if self.too_big_to_sync(self.counter, self.set):
                 self.log.error("state is too big to sync (over %d bytes)", MAX_MESSAGE_BYTES)
-            vector = {"type": "vv", "vv": self.text.version_vector()}
-            for peer in self.peers:
-                self.send(peer, sync)
-                self.send(peer, vector)
+            self.send_sync_round()
             await asyncio.sleep(SYNC_INTERVAL)
+
+    def send_sync_round(self, peers=None):
+        """One round of sync: full counter and set, then the text version
+        vector, to each peer (all of them by default)."""
+        sync = self.sync_message(self.counter, self.set)
+        vector = {"type": "vv", "vv": self.text.version_vector()}
+        for peer in self.peers if peers is None else peers:
+            self.send(peer, sync)
+            self.send(peer, vector)
 
     # ---- main ------------------------------------------------------------
 

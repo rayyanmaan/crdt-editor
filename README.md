@@ -81,7 +81,7 @@ python -m pytest
 
 There are about 1,100 tests and they take around 3 minutes. Most are unit tests of the CRDTs. The rest start real replica processes (and the real network) and break things on purpose: partitions, crashes, lost, duplicated and reordered messages. Those check that every edit ends up on every replica, not just that the texts match.
 
-`test_random_histories.py` uses Hypothesis to make up random histories: random edits on three replicas, messages delivered in any order, lost, or delivered twice, and replicas crashing and restarting from disk. After each one the network heals, and it checks that every replica is identical and that nothing anyone was told was accepted is missing. If a history fails, Hypothesis shrinks it to the shortest one that still fails.
+`test_random_histories.py` uses Hypothesis to make up random histories: random edits on three replicas, messages delivered in any order, lost, or delivered twice, and replicas crashing between edits and restarting from disk. Right after each restart it checks the replica got everything back from its own disk, before any peer can help. At the end the network heals, and it checks that every replica holds identical state and that nothing anyone was told was accepted is missing. If a history fails, Hypothesis shrinks it to a simpler one that still fails. These run the real replica code but swap the sockets for a list Hypothesis controls; the real-process tests cover the sockets.
 
 A few tests drive the dashboard in headless Chrome. They need Google Chrome and Node 22 or newer, and are skipped if either is missing.
 

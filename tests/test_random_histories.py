@@ -4,31 +4,40 @@ The other tests each try one scenario someone thought of. These let
 Hypothesis make them up: it picks a random sequence of steps (type here,
 delete there, deliver this message, lose that one, deliver another twice,
 crash a replica...), runs it, and checks the result. When something fails,
-it shrinks the sequence down to the shortest one that still fails, which is
-much easier to read than a random 40-step history.
+it shrinks the sequence to a simpler one that still fails, which is much
+easier to read than a random 40-step history.
 
 The machine below drives three real Replica objects (replica.py, with
 storage.py saving to a temporary folder) but no sockets: messages a replica
 sends go into a "network" list instead, and a step takes one out and hands
 it to its destination. That way Hypothesis controls the network completely,
-including the order, which real sockets wouldn't let it do. The real-process
-tests (test_cluster_*.py) cover the sockets.
+including the order, which real sockets wouldn't let it do. What this leaves
+out is the transport itself (outbox queues, reconnecting, the proxy); the
+real-process tests (test_cluster_*.py) cover that.
 
-A crash throws a Replica object away and makes a new one from the same
-folder, which is exactly what a restarted process does: memory gone, disk kept.
+A crash happens between two commands, like kill -9 would: the replica's
+memory is gone, and the new one only sees what had reached the operating
+system (its Python file buffers are not flushed for it). Messages to and
+from it that were still in flight are lost. Right after the restart, before
+any peer can help, its state must match what it had before the crash.
+What this doesn't cover is a crash in the middle of a write; the unit tests
+in test_storage.py cover a half-written last line.
 
 At the end, the network heals: replicas keep syncing until nothing changes.
 Then the checks are the two promises from the proposal:
-1. every replica is identical (text with tombstones, counter, set), and
+1. every replica holds identical state (every character with what it was
+   typed after and whether it's deleted, the op logs, counter and set), and
 2. nothing anyone was told was accepted is missing.
 """
 
+import itertools
 import shutil
 import tempfile
+from contextlib import ExitStack
 from unittest import mock
 
 import hypothesis.strategies as st
-from hypothesis import HealthCheck, settings
+from hypothesis import given, settings
 from hypothesis.stateful import RuleBasedStateMachine, invariant, precondition, rule
 
 import replica as replica_module
@@ -41,21 +50,35 @@ CHARS = st.sampled_from("abc")
 ELEMENTS = st.sampled_from(["x", "y"])
 WHO = st.sampled_from(REPLICA_IDS)
 
+HEAL_ROUNDS = 50
+MAX_DELIVERIES = 100_000  # far more than any history here needs; stops a ping-pong bug hanging the test
+
 
 class Histories(RuleBasedStateMachine):
     def __init__(self):
         super().__init__()
         self.folder = tempfile.mkdtemp()
-        # fsync makes each save wait for the disk, which is slow over
-        # thousands of steps. These tests crash a process, not the machine,
-        # and a crashed process's writes are kept by the OS without fsync.
-        self.no_fsync = mock.patch("os.fsync")
-        self.no_fsync.start()
-        self.data_dir = mock.patch.object(replica_module, "DATA_DIR", self.folder)
-        self.data_dir.start()
+        self.patches = ExitStack()
+        try:
+            # fsync makes each save wait for the disk, which is slow over
+            # thousands of steps. These tests crash a process, not the
+            # machine, and the OS keeps a crashed process's writes anyway.
+            self.patches.enter_context(mock.patch("os.fsync"))
+            self.patches.enter_context(mock.patch.object(replica_module, "DATA_DIR", self.folder))
+            # A clock that ticks once per call, so incarnations (and so op
+            # names) are the same every time Hypothesis replays a history.
+            clock = itertools.count(1_000_000)
+            self.patches.enter_context(mock.patch("time.time_ns", lambda: next(clock) * 1_000_000))
+            # The real causal buffer, whatever the environment says.
+            self.patches.enter_context(mock.patch.object(replica_module, "CAUSAL_BUFFER", True))
 
-        self.network = []  # (to, message) in flight, in no particular order
-        self.replicas = {rid: self.start(rid) for rid in REPLICA_IDS}
+            self.network = []  # (to, message) in flight, in no particular order
+            self.replicas = {}
+            for rid in REPLICA_IDS:
+                self.replicas[rid] = self.start(rid)
+        except BaseException:
+            self.clean_up()
+            raise
         # Everything a replica said it accepted.
         self.accepted_ops = []
         self.accepted_increments = 0
@@ -76,10 +99,14 @@ class Histories(RuleBasedStateMachine):
         try:
             self.heal_and_check()
         finally:
-            for r in self.replicas.values():
+            self.clean_up()
+
+    def clean_up(self):
+        try:
+            for r in getattr(self, "replicas", {}).values():
                 r.storage.close()
-            self.no_fsync.stop()
-            self.data_dir.stop()
+        finally:
+            self.patches.close()
             shutil.rmtree(self.folder, ignore_errors=True)
 
     # ---- edits ---------------------------------------------------------------------
@@ -106,6 +133,12 @@ class Histories(RuleBasedStateMachine):
     def type_a_word(self, who, word, data):
         r = self.replicas[who]
         self.type_at(who, data.draw(st.integers(0, len(r.text.text())), label="index"), word)
+
+    @rule(who=WHO, length=st.integers(201, 260))
+    def paste_a_long_text(self, who, length):
+        """More ops than fit in one message (REPAIR_BATCH), so sending and
+        repairing them takes several batches."""
+        self.type_at(who, len(self.replicas[who].text.text()), "z" * length)
 
     @rule(who=WHO, data=st.data())
     def type_backwards(self, who, data):
@@ -134,26 +167,29 @@ class Histories(RuleBasedStateMachine):
 
     @rule(who=WHO, element=ELEMENTS)
     def add(self, who, element):
-        self.accepted_tags.add((element, self.accept(
-            self.replicas[who].on_command({"type": "add", "element": element}))["tag"]))
+        reply = self.accept(self.replicas[who].on_command({"type": "add", "element": element}))
+        self.accepted_tags.add((element, reply["tag"]))
 
     @rule(who=WHO, element=ELEMENTS)
     def remove(self, who, element):
-        reply = self.accept(self.replicas[who].on_command({"type": "remove", "element": element}))
-        self.accepted_removes |= set(reply["tombstoned"])
+        """A remove tombstones exactly the tags of that element this replica
+        has seen and not yet removed. Worked out here, not taken from the
+        reply, so a remove that does the wrong thing can't vouch for itself."""
+        r = self.replicas[who]
+        state = r.set.to_dict()
+        expected = set(state["adds"].get(element, [])) - set(state["removed"])
+        reply = self.accept(r.on_command({"type": "remove", "element": element}))
+        assert set(reply["tombstoned"]) == expected
+        assert element not in r.set.elements()
+        self.accepted_removes |= expected
 
     # ---- the network -----------------------------------------------------------------
 
     @rule(frm=WHO, to=WHO)
     def sync(self, frm, to):
-        """What sync_loop does every second: full counter/set state, then the
-        text version vector (which makes the receiver send back what we lack)."""
-        if frm == to:
-            return
-        r = self.replicas[frm]
-        self.network.append((to, r.sync_message(r.counter, r.set)))
-        self.network.append((to, {"type": "vv", "from": frm, "inc": r.incarnation,
-                                  "vv": r.text.version_vector()}))
+        """One round of what sync_loop sends every second, to one peer."""
+        if frm != to:
+            self.replicas[frm].send_sync_round(peers=[to])
 
     @precondition(lambda self: self.network)
     @rule(data=st.data())
@@ -177,50 +213,54 @@ class Histories(RuleBasedStateMachine):
     @rule(who=WHO)
     def crash_and_restart(self, who):
         old = self.replicas[who]
-        old.storage.close()  # its process is gone, and so is its lock
+        # Like kill -9: the OS drops the lock, but nobody flushes Python's
+        # file buffers. The new replica sees only what reached the OS.
+        old.storage.lock_file.close()
+        old.storage.lock_file = None
         # Messages it hadn't sent yet die with it, and so do messages on
-        # their way to it (its connections close). The worst case for us.
+        # their way to it (its connections close).
         self.network = [(to, msg) for to, msg in self.network if who not in (to, msg["from"])]
-        self.replicas[who] = self.start(who)
-        assert self.replicas[who].incarnation > old.incarnation
+        new = self.start(who)
+        old.storage.close()  # only now, so it can't have helped the new one
+        self.replicas[who] = new
+
+        # Before any peer can help: it has everything it had, from disk alone.
+        assert new.incarnation > old.incarnation
+        assert full_text_state(new) == full_text_state(old)
+        assert new.counter.to_dict() == old.counter.to_dict()
+        assert new.set.to_dict() == old.set.to_dict()
 
     # ---- checks ----------------------------------------------------------------------
 
     @invariant()
-    def a_replica_never_has_more_than_was_made(self):
-        made = {}
-        for e in self.accepted_ops:
-            made[e["origin"]] = max(made.get(e["origin"], 0), e["seq"])
+    def every_op_anyone_has_was_accepted(self):
+        # An op can be saved and not confirmed only if a replica crashes
+        # between the two, which this machine never does mid-command.
+        accepted = {(e["origin"], e["seq"]) for e in self.accepted_ops}
         for r in self.replicas.values():
-            for origin, n in r.text.version_vector().items():
-                # An op can be on disk and not confirmed only if the
-                # replica crashed in between, which this machine never does
-                # mid-command. So every op anyone has was confirmed.
-                assert n <= made.get(origin, 0)
+            for origin, ops in r.text.log.items():
+                for seq in ops:
+                    assert (origin, seq) in accepted
 
     def heal_and_check(self):
         # Deliver everything still in flight, then keep syncing every pair
         # until a whole round changes nothing.
-        for _ in range(50):
+        for _ in range(HEAL_ROUNDS):
             before = self.snapshot()
-            while self.network:
-                to, msg = self.network.pop(0)
-                self.replicas[to].on_peer_message(msg)
-            for frm in REPLICA_IDS:
-                for to in REPLICA_IDS:
-                    if frm != to:
-                        self.sync(frm, to)
-            while self.network:
-                to, msg = self.network.pop(0)
-                self.replicas[to].on_peer_message(msg)
+            self.deliver_everything()
+            for r in self.replicas.values():
+                r.send_sync_round()
+            self.deliver_everything()
             if self.snapshot() == before:
                 break
+        else:
+            raise AssertionError(f"still changing after {HEAL_ROUNDS} rounds of syncing")
 
         replicas = list(self.replicas.values())
         # 1. Identical everywhere.
         first = replicas[0]
         for r in replicas[1:]:
-            assert r.text.doc.state() == first.text.doc.state()
+            assert full_text_state(r) == full_text_state(first)
             assert r.counter.to_dict() == first.counter.to_dict()
             assert r.set.to_dict() == first.set.to_dict()
         # 2. Nothing accepted is missing, and nothing is stuck.
@@ -233,26 +273,40 @@ class Histories(RuleBasedStateMachine):
         assert adds == self.accepted_tags
         assert set(first.set.to_dict()["removed"]) == self.accepted_removes
 
+    def deliver_everything(self):
+        for _ in range(MAX_DELIVERIES):
+            if not self.network:
+                return
+            to, msg = self.network.pop(0)
+            self.replicas[to].on_peer_message(msg)
+        raise AssertionError("messages never stop: replicas keep answering each other")
+
     def snapshot(self):
         return [
-            (r.text.doc.state(), r.counter.to_dict(), r.set.to_dict(), sorted(r.text.buffer))
+            (full_text_state(r), r.counter.to_dict(), r.set.to_dict(), sorted(r.text.buffer))
             for r in self.replicas.values()
         ]
+
+
+def full_text_state(r):
+    """Everything about the text that has to match: every character in
+    document order with what it was typed after and whether it's deleted,
+    and the whole op log. (Not which ops have waited, or the version
+    vector, which follow from the log.)"""
+    nodes = [(n.id, n.after, n.char, n.deleted) for n in r.text.doc.nodes]
+    log = {origin: dict(ops) for origin, ops in r.text.log.items()}
+    return nodes, log
 
 
 Histories.TestCase.settings = settings(
     max_examples=300,
     stateful_step_count=40,
-    deadline=None,
-    suppress_health_check=[HealthCheck.too_slow],
+    deadline=None,  # some steps paste 200+ characters; time isn't what's tested here
 )
 test_random_histories = Histories.TestCase
 
 
 # ---- the log file on its own -----------------------------------------------------------
-
-
-from hypothesis import given  # noqa: E402
 
 JSON_VALUES = st.recursive(
     st.none() | st.booleans() | st.integers() | st.text(max_size=5),
@@ -262,26 +316,32 @@ JSON_VALUES = st.recursive(
 
 
 @settings(max_examples=300, deadline=None)
-@given(saved=st.lists(JSON_VALUES, max_size=6), junk=st.binary(max_size=30))
-def test_whatever_a_crash_leaves_at_the_end_the_saved_ops_load(saved, junk):
-    """A crash can leave any bytes after the last complete line. Every op
-    saved before it still loads, and the log keeps working afterwards."""
+@given(saved=st.lists(JSON_VALUES, max_size=6), unfinished=st.binary(max_size=30))
+def test_an_unfinished_last_line_never_costs_a_saved_op(saved, unfinished):
+    """A crash mid-write leaves the start of a line with no newline after
+    it. Whatever those bytes are, every op saved before it still loads, and
+    the log keeps working afterwards."""
     folder = tempfile.mkdtemp()
+    stores = []
     try:
         s = Storage(folder)
+        stores.append(s)
         s.load_ops()
         s.append_ops(saved)
-        s.ops_file.close()
-        if b"\n" in junk:
-            junk = junk.replace(b"\n", b"")  # a newline would make it a "complete" line
+        s.close()
         with open(s.ops_path, "ab") as f:
-            f.write(junk)
+            f.write(unfinished.replace(b"\n", b""))  # a newline would finish the line
 
         again = Storage(folder)
+        stores.append(again)
         ops, _ = again.load_ops()
         assert ops == saved
         again.append_ops(["next"])
-        again.ops_file.close()
-        assert Storage(folder).load_ops()[0] == saved + ["next"]
+        again.close()
+        last = Storage(folder)
+        stores.append(last)
+        assert last.load_ops()[0] == saved + ["next"]
     finally:
+        for store in stores:
+            store.close()
         shutil.rmtree(folder, ignore_errors=True)
